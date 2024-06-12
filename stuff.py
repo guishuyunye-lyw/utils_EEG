@@ -912,6 +912,7 @@ def condition_difference_score_permutations(data, time_opt='features',
         for i in range(n_trials):
             for j in range(i + 1,n_trials):
                 if method == 'correlation':
+                    # keep original r, becasue r have a range of [-1, 1],
                     r, _ = pearsonr(data_preprocessed[0, i], data_preprocessed[1, j])
                     # distance = 1 - np.abs(r) if use_abs else 1 - r
                     distance = r
