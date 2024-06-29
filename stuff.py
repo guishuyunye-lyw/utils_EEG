@@ -66,6 +66,56 @@ def load_epochs(sub_ids, list_epochs_allSubs, base_data_path, channels_field):
         # 将读取的epochs对象添加到列表中
         list_epochs_allSubs.append(epochs_sub)
 
+'''
+replace epochs data with power data 
+'''
+def load_epochs_tfr(sub_ids, list_epochs_allSubs, base_data_path, channels_field, freqs, n_cycles, decim=1, average=False):
+    '''
+    读取epochs数据，并将读取的epochs对象添加到列表中。
+
+    参数:
+    sub_ids (list): 包含所有被试的ID的列表。
+    list_epochs_allSubs (list): 包含所有被试的epochs对象的列表。
+    base_data_path (str): 数据存放路径的前缀。
+    channels_field (list): 包含所有被试的通道名称的列表。
+    freqs (array): 要分析的频率数组。
+    n_cycles (int or array): 每个频率的周期数，可以是一个常数或一个数组。
+    decim (int): 下采样因子，默认值为3。
+    average (bool): 是否对每个epoch的TFR结果求平均，默认值为False。
+    '''
+
+    for sub_id in sub_ids:
+        # 为每个sub_id更新data_path
+        data_path = base_data_path + sub_id + '-epo.fif'
+
+        # 读取epochs数据
+        epochs_sub = mne.read_epochs(fname=data_path, preload=True)
+
+        # 选择特定的通道
+        epochs_sub = epochs_sub.pick(picks=channels_field)
+
+        # 和最少试次的条件对齐
+        epochs_sub.equalize_event_counts(method='mintime')
+
+        # 计算TFR
+        power = mne.time_frequency.tfr_morlet(epochs_sub, freqs=freqs, n_cycles=n_cycles,
+                                              use_fft=True, return_itc=False, decim=decim, n_jobs=1, average=average)
+
+        # 提取功率数据
+        power_data = power.data
+
+        # 平均频率维度的功率数据
+        averaged_power_data = power_data.mean(axis=2)  # Shape will be (n_epochs, n_channels, n_times)
+
+        # Copy original epochs and replace the data
+        new_epochs = epochs_sub.copy()
+        new_epochs._data = averaged_power_data
+
+        # 将新的epochs对象添加到列表中
+        list_epochs_allSubs.append(new_epochs)
+
+
+
 
 def format_channel_names(channel_names):
     """
