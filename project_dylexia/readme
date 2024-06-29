@@ -1,0 +1,5 @@
+I want to seperate decoding from statistic and plot..
+
+I want to store all kinds of decoding and then do statistic using function in 统计 module
+
+I should refine the notes `in jupyter file for decoding...
