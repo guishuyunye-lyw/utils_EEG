@@ -33,6 +33,8 @@ from rpy2.robjects import pandas2ri
 from rpy2.robjects.conversion import localconverter
 from rpy2.robjects.packages import importr
 from scipy.stats import pearsonr
+from scipy.spatial.distance import pdist, squareform
+from mne_rsa import searchlight
 
 # 定义一个函数来处理读取epochs的重复逻辑
 # 可以选取某些特定通道
@@ -132,6 +134,33 @@ def format_channel_names(channel_names):
     # 使用列表推导和字符串的 join 方法来创建格式化的字符串
     formatted_names = ', '.join(f"'{name}'" for name in channel_names)
     return f"[{formatted_names}]"
+
+
+def generate_channel_patches(file_path: str, spatial_radius: float) -> dict:
+    # Load the epoch data for the searchlight analysis
+    # exclude eog!!!!
+    epochs = mne.read_epochs(file_path, preload=True, )  # include eog!!!!
+    epochs.drop_channels(['VEOG'])
+
+    # Get data shape
+    shape = epochs.get_data().shape
+
+    # Create a distance matrix using the channel locations
+    picks = mne.pick_types(epochs.info, meg=True, eeg=True, eog=False, stim=False)
+    pos = [epochs.info['chs'][pick]['loc'][:3] for pick in picks]
+    dist = squareform(pdist(pos))
+
+    # Initialize the searchlight generator
+    sl = searchlight(shape=shape, dist=dist, spatial_radius=spatial_radius, temporal_radius=None)
+
+    # Generate the patches from the searchlight generator
+    field_dict = {}
+    for index, patch in zip(picks, sl):
+        central_channel = epochs.ch_names[index]
+        surrounding_channels = [epochs.ch_names[idx] for idx in patch[1]]
+        field_dict[central_channel] = surrounding_channels
+
+    return field_dict
 
 
 def organize_eeg_data_by_subject_and_condition(T1_sub_ids, list_epochs_One, list_epochs_M2, list_epochs_S2,
@@ -237,7 +266,13 @@ def save_arrays_to_csv(results_m2, results_s2, filename_m2, filename_s2, shape):
     np.savetxt(filename_m2, array_m2, delimiter=",")
     np.savetxt(filename_s2, array_s2, delimiter=",")
 
+'''
+why don't use package of python?
 
+'''
+# Ensure automatic conversion between Pandas DataFrame and R DataFrame
+# extract it out from function to avoid run repeatedly.
+pandas2ri.activate()
 def fit_lmer_model(data, formula=None):
     """
     Fits a linear mixed effects model to the data using R's lmerTest package.
@@ -256,8 +291,8 @@ def fit_lmer_model(data, formula=None):
     # print('after dropna')
     # print(data.isna().sum())  # Sum of NAs in each column
 
-    # Ensure automatic conversion between Pandas DataFrame and R DataFrame
-    pandas2ri.activate()
+    # extract it out from function to avoid run repeatedly.
+    # pandas2ri.activate()
 
     # Convert the Pandas DataFrame to an R DataFrame
     with localconverter(ro.default_converter + pandas2ri.converter):
@@ -274,19 +309,142 @@ def fit_lmer_model(data, formula=None):
     ''')
 
     # Deactivate the Pandas to R DataFrame conversion
-    pandas2ri.deactivate()
+    # pandas2ri.deactivate()
 
-    # print(x)
+    print(x)
+
     return x[0], x[1]
 
+'''
+I need df(ziyoudu) to calculate t-threshold
+'''
+import scipy.stats
+def fit_lmer_model_t_threshold(data, formula, alpha=0.05):
+    """
+    Calculates the critical t-threshold for a given alpha level using R's lmerTest package.
 
+    Parameters:
+    - data: Pandas DataFrame containing the data.
+    - formula: A string representing the model formula in R's syntax.
+    - alpha: Significance level for the threshold.
+
+    Returns:
+    - t-threshold value.
+    """
+    # Fit the model to get the degrees of freedom
+    data.dropna(inplace=True)  # Drop rows with NAs
+
+    # Ensure automatic conversion between Pandas DataFrame and R DataFrame
+    pandas2ri.activate()
+
+    # Convert the Pandas DataFrame to an R DataFrame
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        r_data = ro.conversion.py2rpy(data)
+
+    # Pass the data to the R environment
+    ro.globalenv['r_data'] = r_data
+
+    # Fit the model in R and get the degrees of freedom
+    result = ro.r('''
+    library(lmerTest)
+    fit <- lmer(''' + formula + ''', r_data)
+    summary(fit)$coefficients["categoryS", c("df")]
+    ''')
+
+    # Deactivate the Pandas to R DataFrame conversion
+    pandas2ri.deactivate()
+
+    # Extract degrees of freedom
+    df = result[0]
+
+    # Calculate the t-threshold
+    t_threshold = scipy.stats.t.ppf(1 - alpha, df)
+
+    return t_threshold
+
+# Loop over the ndarray and apply the model
+# add a progress bar.
+from tqdm import tqdm  # Import the tqdm library
+def apply_lmer_models_to_array(array_of_dfs, model_formula='distance ~ category + logic1 + logic2 + (1|subId)'):
+    """
+    Applies a linear mixeAd-effects model to each DataFrame stored in a 1D ndarray.
+
+    Parameters:
+        5733 = times(91) * channels(63) flatten
+    - array_of_dfs: ndarray, shape (1, 5733) containing pandas DataFrames.
+    - model_formula: str, formula to be used in the linear mixed-effects model.
+
+    Returns:
+    - ndarray of shape (5733,) containing the t-values from the model fitting.
+    """
+    # Initialize an array to store the t-values, array_of_dfs has shape (1, 5733)
+    results = np.zeros(array_of_dfs.shape[1], dtype=float)  # Shape (5733,)
+
+    # Loop over the second dimension of the array since it's now 1D in usage
+    # for j in range(array_of_dfs.shape[1]):
+    # Loop over the second dimension of the array with a progress bar
+    for j in tqdm(range(array_of_dfs.shape[1]), desc="Processing DataFrames"):
+        # Extract the DataFrame at the current index
+        df = array_of_dfs[0, j]  # Access the DataFrame
+        try:
+            t_value, _ = fit_lmer_model(df, model_formula)
+            results[j] = t_value
+        except Exception as e:
+            print(f"Error processing DataFrame at index {j}: {e}")
+            results[j] = np.nan  # Use NaN for failed model fittings
+
+    return results
+
+# parallel version
+def process_single_dataframe(df, model_formula):
+    """Helper function to process a single DataFrame."""
+    try:
+        t_value, _ = fit_lmer_model(df, model_formula)
+        return t_value
+    except Exception as e:
+        print(f"Error processing DataFrame: {e}")
+        return np.nan
+from joblib import Parallel, delayed
+import os
+from joblib import Parallel, delayed
+
+# Calculate the number of cores to use, leaving 2 cores free
+total_cores = os.cpu_count()
+n_jobs = max(1, total_cores - 2)  # Ensure at least 1 core is used
+def apply_lmer_models_to_array_parallel(array_of_dfs, model_formula='distance ~ category + logic1 + logic2 + (1|subId)', n_jobs=n_jobs):
+    """
+    Applies a linear mixed-effects model to each DataFrame stored in a 1D ndarray in parallel.
+
+    Parameters:
+        5733 = times(91) * channels(63) flatten
+    - array_of_dfs: ndarray, shape (1, 5733) containing pandas DataFrames.
+    - model_formula: str, formula to be used in the linear mixed-effects model.
+    - n_jobs: int, number of parallel jobs. -1 uses all available cores.
+
+    Returns:
+    - ndarray of shape (5733,) containing the t-values from the model fitting.
+    """
+    print('parallel')
+
+    # Initialize an array to store the t-values, array_of_dfs has shape (1, 5733)
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(process_single_dataframe)(array_of_dfs[0, j], model_formula)
+        for j in tqdm(range(array_of_dfs.shape[1]), desc="Processing DataFrames")
+    )
+
+    return np.array(results)
+
+
+'''
+one channel all time points find and test cluster
+'''
 def clusterbased_permutation_1d_1samp_2sided_mixmodel_2007(
                                                             p_threshold=0.05, clusterp_threshold=0.05,
                                                            n_threshold=2,
                                                            iter=1000,
                                                            updated_dataframes_list=None,
                                                            model_formula=None,
-                                                           x=450
+                                                           x=450, allow_permutation = True
                                                            ):
     """
     1-sample & 2-sided cluster based permutation test for 2-D results
@@ -313,6 +471,9 @@ def clusterbased_permutation_1d_1samp_2sided_mixmodel_2007(
         The permutation test resultz, p-values.
         The shape of ps is [x]. The values in ps should be 0 or 1 or -1, which represent not significant point or
         significantly greater point or significantly less point after cluster-based permutation test, respectively.
+
+    here, ps_stats is dict:n_channel
+
     """
     ps = np.zeros([x])
     ps2 = np.zeros([x])
@@ -320,10 +481,9 @@ def clusterbased_permutation_1d_1samp_2sided_mixmodel_2007(
     cluster_p_values_pos = [] # 用来存储每个cluster的p值 = index/iter
     cluster_p_values_neg = []
     print(len(updated_dataframes_list))
-    print(x)
 
     for t in range(x):
-
+        print(t)
         ts[t], p = fit_lmer_model(updated_dataframes_list[t], model_formula)
         # print(p)
         ps2[t] = p # ps2 record original p-values
@@ -337,131 +497,134 @@ def clusterbased_permutation_1d_1samp_2sided_mixmodel_2007(
     # cluster_n1 就是正的情况.
     cluster_index1, cluster_n1, cluster_index2, cluster_n2 = get_cluster_index_1d_2sided(ps)
 
-    '''
-    改成标准做法
-    https://www.nature.com/articles/s41562-020-0901-2#Sec10
-    '''
-    if cluster_n1 != 0:
-        cluster_ts = np.zeros([cluster_n1])
-        for i in range(cluster_n1):
-            for t in range(x):
-                if cluster_index1[t] == i + 1:
-                    cluster_ts[i] = cluster_ts[i] + ts[t]
+    # Perform permutation test if allowed
+    if allow_permutation:
 
-        permu_ts = np.zeros([iter])  # 用来存储1000个T值
-        # chance = np.full([nsubs], level)
-        print("\nPermutation test")
-
-        for i in range(iter):
-            i_ps = np.zeros([x])
-            i_ts = np.zeros([x])
-            # i_results = results[np.random.permutation(results.shape[0])]
-            for t in range(x):
-                '''
-                shuffle
-                '''
-                data_sample = updated_dataframes_list[t]
-                shuffled_data = data_sample.groupby('subId', group_keys=False).apply(
-                    lambda x: x.assign(category=x['category'].sample(frac=1).values))
-                '''
-                算t p
-                '''
-                i_ts[t], p = fit_lmer_model(shuffled_data, model_formula)
-                '''
-                单边转换
-                '''
-                if i_ts[t] > 0:  # 分边处理
-                    p = p / 2
-                else:
-                    p = 1  # 认为最大,没有意义.
-                # 单边?
-                if p < p_threshold and i_ts[t] > 0:
-                    i_ps[t] = 1
-                else:
-                    i_ps[t] = 0
-
-            # 标注好显著iter的index,有1 有2,
-            # 给出iter 的cluster数量
-            i_cluster_index, i_cluster_n = get_cluster_index_1d_1sided(i_ps)
-            if i_cluster_n != 0:
-                i_cluster_ts = np.zeros([i_cluster_n])
-                for j in range(i_cluster_n):
-                    for t in range(x):
-                        if i_cluster_index[t] == j + 1:
-                            i_cluster_ts[j] = i_cluster_ts[j] + i_ts[t]
-                permu_ts[i] = np.max(i_cluster_ts)
-            else:
-                permu_ts[i] = np.max(i_ts)
-            show_progressbar("Calculating", (i + 1) * 100 / iter)
-            if i == (iter - 1):
-                print("\nCluster-based permutation test finished!\n")
-
-        for i in range(cluster_n1):
-            index = 0
-            for j in range(iter):
-                if cluster_ts[i] > permu_ts[j]:
-                    index = index + 1
-            if index < iter * (1 - clusterp_threshold):
+        '''
+        改成标准做法
+        https://www.nature.com/articles/s41562-020-0901-2#Sec10
+        '''
+        if cluster_n1 != 0:
+            cluster_ts = np.zeros([cluster_n1])
+            for i in range(cluster_n1):
                 for t in range(x):
                     if cluster_index1[t] == i + 1:
-                        ps[t] = 0
-            cluster_p_values_pos.append(index / iter) # 存储每个cluster的p值 = index/iter
+                        cluster_ts[i] = cluster_ts[i] + ts[t]
 
-    if cluster_n2 != 0:
-        cluster_ts = np.zeros([cluster_n2])
-        for i in range(cluster_n2):
-            for t in range(x):
-                if cluster_index2[t] == i + 1:
-                    cluster_ts[i] = cluster_ts[i] + ts[t]
+            permu_ts = np.zeros([iter])  # 用来存储1000个T值
+            # chance = np.full([nsubs], level)
+            print("\nPermutation test")
 
-        permu_ts = np.zeros([iter])  # 用来存储1000个T值
-        # chance = np.full([nsubs], level)
-        print("\nPermutation test")
+            for i in range(iter):
+                i_ps = np.zeros([x])
+                i_ts = np.zeros([x])
+                # i_results = results[np.random.permutation(results.shape[0])]
+                for t in range(x):
+                    '''
+                    shuffle
+                    '''
+                    data_sample = updated_dataframes_list[t]
+                    shuffled_data = data_sample.groupby('subId', group_keys=False).apply(
+                        lambda x: x.assign(category=x['category'].sample(frac=1).values))
+                    '''
+                    算t p
+                    '''
+                    i_ts[t], p = fit_lmer_model(shuffled_data, model_formula)
+                    '''
+                    单边转换
+                    '''
+                    if i_ts[t] > 0:  # 分边处理
+                        p = p / 2
+                    else:
+                        p = 1  # 认为最大,没有意义.
+                    # 单边?
+                    if p < p_threshold and i_ts[t] > 0:
+                        i_ps[t] = 1
+                    else:
+                        i_ps[t] = 0
 
-        for i in range(iter):
-            i_ps = np.zeros([x])
-            i_ts = np.zeros([x])
-            # i_results = results[np.random.permutation(results.shape[0])]
-            for t in range(x):
-                data_sample = updated_dataframes_list[t]
-                shuffled_data = data_sample.groupby('subId', group_keys=False).apply(
-                    lambda x: x.assign(category=x['category'].sample(frac=1).values))
-                i_ts[t], p = fit_lmer_model(shuffled_data, model_formula)
-                if i_ts[t] < 0:  # 分边处理
-                    p = p / 2
+                # 标注好显著iter的index,有1 有2,
+                # 给出iter 的cluster数量
+                i_cluster_index, i_cluster_n = get_cluster_index_1d_1sided(i_ps)
+                if i_cluster_n != 0:
+                    i_cluster_ts = np.zeros([i_cluster_n])
+                    for j in range(i_cluster_n):
+                        for t in range(x):
+                            if i_cluster_index[t] == j + 1:
+                                i_cluster_ts[j] = i_cluster_ts[j] + i_ts[t]
+                    permu_ts[i] = np.max(i_cluster_ts)
                 else:
-                    p = 1  # 认为最大,没有意义.
-                # 单边?
-                if p < p_threshold and i_ts[t] < 0:
-                    i_ps[t] = 1
-                else:
-                    i_ps[t] = 0
-            # 标注好显著的index,和cluster的个数?
-            i_cluster_index, i_cluster_n = get_cluster_index_1d_1sided(i_ps)  # 双边标注
-            if i_cluster_n != 0:
-                i_cluster_ts = np.zeros([i_cluster_n])
-                for j in range(i_cluster_n):
+                    permu_ts[i] = np.max(i_ts)
+                show_progressbar("Calculating", (i + 1) * 100 / iter)
+                if i == (iter - 1):
+                    print("\nCluster-based permutation test finished!\n")
+
+            for i in range(cluster_n1):
+                index = 0
+                for j in range(iter):
+                    if cluster_ts[i] > permu_ts[j]:
+                        index = index + 1
+                if index < iter * (1 - clusterp_threshold):
                     for t in range(x):
-                        if i_cluster_index[t] == j + 1:
-                            i_cluster_ts[j] = i_cluster_ts[j] + i_ts[t]
-                permu_ts[i] = np.max(i_cluster_ts)
-            else:
-                permu_ts[i] = np.max(i_ts)
-            show_progressbar("Calculating", (i + 1) * 100 / iter)
-            if i == (iter - 1):
-                print("\nCluster-based permutation test finished!\n")
+                        if cluster_index1[t] == i + 1:
+                            ps[t] = 0
+                cluster_p_values_pos.append(index / iter) # 存储每个cluster的p值 = index/iter
 
-        for i in range(cluster_n2):
-            index = 0
-            for j in range(iter):
-                if cluster_ts[i] < permu_ts[j]: # should be <
-                    index = index + 1
-            # when cannot reject H0, then p = 0
-            if index < iter * (1 - clusterp_threshold):
+        if cluster_n2 != 0:
+            cluster_ts = np.zeros([cluster_n2])
+            for i in range(cluster_n2):
                 for t in range(x):
                     if cluster_index2[t] == i + 1:
-                        ps[t] = 0
-            cluster_p_values_neg.append(index / iter) # 存储每个cluster的p值 = index/iter
+                        cluster_ts[i] = cluster_ts[i] + ts[t]
+
+            permu_ts = np.zeros([iter])  # 用来存储1000个T值
+            # chance = np.full([nsubs], level)
+            print("\nPermutation test")
+
+            for i in range(iter):
+                i_ps = np.zeros([x])
+                i_ts = np.zeros([x])
+                # i_results = results[np.random.permutation(results.shape[0])]
+                for t in range(x):
+                    data_sample = updated_dataframes_list[t]
+                    shuffled_data = data_sample.groupby('subId', group_keys=False).apply(
+                        lambda x: x.assign(category=x['category'].sample(frac=1).values))
+                    i_ts[t], p = fit_lmer_model(shuffled_data, model_formula)
+                    if i_ts[t] < 0:  # 分边处理
+                        p = p / 2
+                    else:
+                        p = 1  # 认为最大,没有意义.
+                    # 单边?
+                    if p < p_threshold and i_ts[t] < 0:
+                        i_ps[t] = 1
+                    else:
+                        i_ps[t] = 0
+                # 标注好显著的index,和cluster的个数?
+                i_cluster_index, i_cluster_n = get_cluster_index_1d_1sided(i_ps)  # 双边标注
+                if i_cluster_n != 0:
+                    i_cluster_ts = np.zeros([i_cluster_n])
+                    for j in range(i_cluster_n):
+                        for t in range(x):
+                            if i_cluster_index[t] == j + 1:
+                                i_cluster_ts[j] = i_cluster_ts[j] + i_ts[t]
+                    permu_ts[i] = np.max(i_cluster_ts)
+                else:
+                    permu_ts[i] = np.max(i_ts)
+                show_progressbar("Calculating", (i + 1) * 100 / iter)
+                if i == (iter - 1):
+                    print("\nCluster-based permutation test finished!\n")
+
+            for i in range(cluster_n2):
+                index = 0
+                for j in range(iter):
+                    if cluster_ts[i] < permu_ts[j]: # should be <
+                        index = index + 1
+                # when cannot reject H0, then p = 0
+                if index < iter * (1 - clusterp_threshold):
+                    for t in range(x):
+                        if cluster_index2[t] == i + 1:
+                            ps[t] = 0
+                cluster_p_values_neg.append(index / iter) # 存储每个cluster的p值 = index/iter
 
 
     newps = np.zeros([x + 2])
@@ -487,7 +650,10 @@ def clusterbased_permutation_1d_1samp_2sided_mixmodel_2007(
     print("p-values:", ps2)
 
     return ps, ts, ps2, cluster_p_values_pos, cluster_p_values_neg
+'''
 
+
+'''
 def plot_tbyt_diff_decoding_acc(acc1, acc2, start_time=0, end_time=1, time_interval=0.01, chance=0.5, p=0.05, cbpt=True,
                                 clusterp=0.05, stats_time=[0, 1], color1='r', color2='b', label1='Condition1',
                                 label2='Condition2', xlim=[0, 1], ylim=[0.4, 0.8], xlabel='Time (s)',
@@ -906,6 +1072,339 @@ def plot_tbyt_diff_decoding_acc_withoutStatic(acc1, acc2, start_time=0, end_time
     plt.show()
 
     return ps1, ps2, ps
+
+'''
+
+for hotmap ploting
+
+hotmap with static process (refine from the neurora function plot_hetmap_withstata)
+
+I deleted the plot part and left only statistical part.
+
+in fact, I think this function and plot_tbyt_diff_decoding_acc  
+
+are same..
+
+hotmap function include a loop over all fields and plot_tbyt_diff_decoding_acc
+only process one field.
+
+the function seems only prepare data for permutation test.
+
+'''
+def mixmodelMultiChannel(
+                            chllabels=None, time_unit=[0, 0.1], lim=[-7, 7], p=0.05, cbpt=False,
+                            clusterp=0.05, stats_time=[0, 1], smooth=False, xlabel='Time (s)', ylabel='Channel',
+                            clabel='t', ticksize=18, figsize=None, cmap=None, title=None, title_fontsize=16,
+                            updated_dfs_dict=None, nts=450, nsubs=28, model_formula = None, num_iter = 10):
+    """
+    plot the hotmap of statistical results for channels/regions by time sequence
+
+    results : array
+        The results.
+        The shape of results must be [n_subs, n_chls, ts, 2] or [n_subs, n_chls, ts]. n_subs represents the number of
+        subjects. n_chls represents the number of channels or regions. ts represents the number of time-points. If shape
+        of corrs is [n_chls, ts 2], each time-point of each channel/region contains a r-value and a p-value. If shape is
+        [n_chls, ts], only r-values.
+    chllabels : string-array or string-list or None. Default is None.
+        The label for channels/regions.
+        If label=None, the labels will be '1st', '2nd', '3th', '4th', ... automatically.
+    time_unit : array or list [start_t, t_step]. Default is [0, 0.1]
+        The time information of corrs for plotting
+        start_t represents the start time and t_step represents the time between two adjacent time-points. Default
+        time_unit=[0, 0.1], which means the start time of corrs is 0 sec and the time step is 0.1 sec.
+    lim : array or list [min, max]. Default is [0, 1].
+        The corrs view lims.
+    p: float. Default is 0.05.
+        The p threshold for outline.
+    cbpt : bool True or False. Default is True.
+        Conduct cluster-based permutation test or not.
+    clusterp : float. Default is 0.05.
+        The threshold of cluster-defining p-values.
+    stats_time : array or list [stats_time1, stats_time2]. Default os [0, 1].
+        The time period for statistical analysis.
+    smooth : bool True or False. Default is False.
+        Smooth the results or not.
+    xlabel : string. Default is 'Time (s)'.
+        The label of x-axis.
+    ylabel : string. Default is 'Channel'.
+        The label of y-axis.
+    clabel : string. Default is 'Similarity'.
+        The label of color-bar.
+    ticksize : int or float. Default is 18.
+        The size of the ticks.
+    figsize : array or list, [size_X, size_Y]
+        The size of the figure.
+        If figsize=None, the size of the figure will be ajusted automatically.
+    cmap : matplotlib colormap or None. Default is None.
+        The colormap for the figure.
+        If cmap=None, the ccolormap will be 'bwr'.
+    title : string-array. Default is None.
+        The title of the figure.
+    title_fontsize : int or float. Default is 16.
+        The fontsize of the title.
+    """
+
+
+    # if len(np.shape(results)) < 3 or len(np.shape(results)) > 4:
+    #     return "Invalid input!"
+
+    # get the number of channels
+    # nchls = results.shape[1]
+    nchls = len(chllabels)
+
+    # get the number of time-points
+    # nts = results.shape[2]
+    nts = nts
+
+    # get the start time and the time step
+    start_time = time_unit[0]
+    tstep = time_unit[1]
+
+    # calculate the end time
+    end_time = start_time + nts * tstep
+
+    delta1 = (stats_time[0] - start_time) / tstep - int((stats_time[0] - start_time) / tstep)
+    delta2 = (stats_time[1] - start_time) / tstep - int((stats_time[1] - start_time) / tstep)
+    if delta1 == 0:
+        stats_time1 = int((stats_time[0] - start_time) / tstep)
+    else:
+        stats_time1 = int((stats_time[0] - start_time) / tstep) + 1
+    if delta2 == 0:
+        stats_time2 = int((stats_time[1] - start_time) / tstep)
+    else:
+        stats_time2 = int((stats_time[1] - start_time) / tstep) + 1
+
+    # # set labels of the channels
+    # if chllabels == None:
+    #
+    #     chllabels = []
+    #     for i in range(nchls):
+    #
+    #         if i % 10 == 0 and i != 10:
+    #             newlabel = str(i + 1) + "st"
+    #         elif i % 10 == 1 and i != 11:
+    #             newlabel = str(i + 1) + "nd"
+    #         elif i % 10 == 2 and i != 12:
+    #             newlabel = str(i + 1) + "rd"
+    #         else:
+    #             newlabel = str(i + 1) + "th"
+    #
+    #         chllabels.append(newlabel)
+    #
+    # '''
+    # 后面不用result 那就全都不要了
+    # '''
+    # # if len(results.shape) == 4:
+    # #     rlts = results[:, :, :, 0]
+    # # elif len(results.shape) == 3:
+    # #     rlts = results
+    # #
+    #
+    # '''
+    # 比较有问题的地方是这里,
+    #
+    # 我的数据如果要进行 smooth,还是非常复杂的,需要重构了..
+    # '''
+    # # # smooth the results
+    # # if smooth == True:
+    # #
+    # #     for chl in range(nchls):
+    # #         rlts[:, chl] = smooth_1d(rlts[:, chl])
+    #
+    # fig = plt.gcf()
+    # size = fig.get_size_inches()
+    #
+    # if figsize == None:
+    #     size_x = nts * tstep * (size[0] - 2) + 2
+    #     size_y = nchls * 0.2 * (size[1] - 1.5) + 1.5
+    # else:
+    #     size_x = figsize[0]
+    #     size_y = figsize[1]
+    #
+    # fig.set_size_inches(size_x, size_y)
+    #
+    # delta = (size_y * 3) / (size_x * 4)
+    #
+    # '''
+    # !!!! 统计不需要ts了,但是作图需要啊...所以还是得想办法把result还原出来,相当于数据的另一种形态.
+    # 而且你的result不应该是这样子?
+    # 应该是 2sample之间进行比较, 我应该把 array_massed_s, array_spaced_s 给传进来使用.
+    #
+    #
+    # ts只在非permutation的那段代码中用到,所以可以直接不要了.
+    #
+    # ts将具有与rlts中的n_chls和ts相对应的结构，但不再有n_subs维度，因为沿该维度进行了统计测试。
+    #
+    # '''
+    # # # ts = ttest_1samp(rlts, 0, axis=0)[:, :, 0]
+    # # ts = np.zeros((nchls, nts))
+    # #
+    # # # 对每个通道和每个时间点进行t检验
+    # # for chl in range(nchls):
+    # #     for time_point in range(nts):
+    # #         # 提取两组数据中对应的数据
+    # #         massed_data = rlts_array_massed_s[:, chl, time_point]
+    # #         spaced_data = rlts_array_spaced_s[:, chl, time_point]
+    # #
+    # #         # 执行t检验
+    # #         # 这里可以考虑ttest_rel.
+    # #         t_stat, p_val = ttest_ind(spaced_data, massed_data)
+    # #
+    # #         # 存储t统计量
+    # #         ts[chl, time_point] = t_stat
+    # #
+    # #     ps = np.zeros([nchls, nts])
+
+    if cbpt == True:
+
+        # Initialize dictionaries to store results
+        stats_results = {
+            'ps_stats': {},
+            'ts_stats': {},
+            'pss_stats': {},
+            'cluster_p_values_pos': {},
+            'cluster_p_values_neg': {}
+        }
+
+        for chl in range(nchls):
+            # 是和0进行比较 level = 0, 是否有t大于0显著的cluster.
+            # updated_dataframes_list =updated_dataframes_list[stats_time1-1:stats_time2] 不能这么写了.
+
+            channel = chl
+            time_range = range(stats_time1, stats_time2)  # 时间范围
+
+            # 初始化一个列表来存储这个时间范围内的所有DataFrame
+            list_time_range_dfs = []
+
+            # 遍历时间范围，获取每个时间点对应的DataFrame，并添加到列表中
+            for time_point in time_range:
+                if time_point in updated_dfs_dict[channel]:  # 确保这个时间点的数据是存在的
+                    print('append success')
+                    list_time_range_dfs.append(updated_dfs_dict[channel][time_point])
+
+            # 此时，time_range_dfs包含了第1个channel在时间点0到199的所有DataFrame副本
+            # rlts可以直接删除了.
+            # 真正费时间的是 iter, 测试的时候感觉应该把这个参数调低一点.
+            print(chl)
+
+            allow_permutation = True
+            if num_iter == 0:
+                allow_permutation = False
+            else:
+                allow_permutation = True
+
+            ps_stats, ts_stats, pss_stats, cluster_p_values_pos, cluster_p_values_neg = clusterbased_permutation_1d_1samp_2sided_mixmodel_2007(
+                p_threshold=p,
+                clusterp_threshold=clusterp, iter=num_iter,
+                updated_dataframes_list=list_time_range_dfs[
+                                        stats_time1:stats_time2],
+                x=stats_time2 - stats_time1,
+                model_formula= model_formula
+                # 因为你就给了updated_dataframes_list的是统计区间数据 而不是所有数据.
+                ,allow_permutation=allow_permutation
+            )
+            print(pss_stats)
+            ps = np.zeros([nts])
+            ps[stats_time1:stats_time2] = ps_stats
+
+            # Store the results for this channel
+            stats_results['ps_stats'][chl] = ps_stats
+            stats_results['ts_stats'][chl] = ts_stats
+            stats_results['pss_stats'][chl] = pss_stats
+
+            stats_results['cluster_p_values_pos'][chl] = cluster_p_values_pos
+            stats_results['cluster_p_values_neg'][chl] = cluster_p_values_neg
+
+    else:
+        print('请设置 cbpt=Ture,进行permutation')
+
+    '''
+    我一定会进行clusterbased permutation.
+    
+    but for test... I don't need.
+
+    '''
+
+    # else:
+    #     for chl in range(nchls):
+    #         for t in range(nts):
+    #             if t >= stats_time1 and t < stats_time2:
+    #                 ps[chl, t] = ttest_1samp(rlts[:, chl, t], 0)[1]
+    #                 if ps[chl, t] < p and ts[chl, t] > 0:
+    #                     ps[chl, t] = 1
+    #                 elif ps[chl, t] < p and ts[chl, t] < 0:
+    #                     ps[chl, t] = -1
+    #                 else:
+    #                     ps[chl, t] = 0
+
+
+
+    return stats_results
+
+'''
+keep only plot part except statistical part.
+'''
+def plot_heatmap(ts_stats, chllabels, time_unit=[0, 0.1], lim=[-7, 7], xlabel='Time (s)', ylabel='Channel',
+                 clabel='t', ticksize=18, figsize=(10, 5), cmap='bwr', title=None, title_fontsize=16):
+    """
+    Plots a heatmap of statistical results for channels/regions by time sequence.
+
+    Parameters:
+        ts_stats : array
+            The array containing statistical values to be plotted.
+            Expected shape is [n_chls, n_ts] where n_chls is the number of channels and n_ts is the number of time points.
+        chllabels : list
+            Labels for the channels.
+        time_unit : list
+            Time information for plotting: [start_time, time_step].
+        lim : list
+            Color scale limits: [min_value, max_value].
+        xlabel, ylabel, clabel : str
+            Labels for the x-axis, y-axis, and colorbar, respectively.
+        ticksize : int
+            Font size for tick labels.
+        figsize : tuple
+            Figure size.
+        cmap : str or Colormap
+            Matplotlib colormap.
+        title : str
+            Title of the plot.
+        title_fontsize : int
+            Font size for the plot title.
+    """
+
+    # Get the number of time points and start/end times
+    nts = ts_stats.shape[1]
+    start_time = time_unit[0]
+    tstep = time_unit[1]
+    end_time = start_time + nts * tstep
+
+    # Setting the figure size
+    plt.figure(figsize=figsize)
+
+    # Create a meshgrid for plotting
+    x = np.linspace(start_time, end_time, nts)
+    y = np.arange(len(chllabels))
+    X, Y = np.meshgrid(x, y)
+
+    # Plotting the heatmap
+    heatmap = plt.pcolormesh(X, Y, ts_stats, cmap=cmap, vmin=lim[0], vmax=lim[1])
+    plt.colorbar(heatmap, label=clabel)
+
+    # Setting labels and ticks
+    plt.xlabel(xlabel, fontsize=20)
+    plt.ylabel(ylabel, fontsize=20)
+    plt.yticks(np.arange(len(chllabels)) + 0.5, chllabels, fontsize=ticksize)
+    plt.xticks(fontsize=ticksize)
+
+    # Setting the title
+    if title:
+        plt.title(title, fontsize=title_fontsize)
+
+    # Display the plot
+    plt.tight_layout()
+    plt.show()
+
 '''
 
 part for calculate distance 
@@ -922,6 +1421,8 @@ def condition_difference_score_permutations(data, time_opt='features',
                                             method='correlation', use_abs=False,
                                             return_type='all'):
     """
+    for sigle subject? 应该是了, 否则会有 mix model
+
     Calculate distances representing the differences between two conditions in EEG data across time windows,
     considering all possible pairings of trials between the two conditions using specified distance metric.
 
