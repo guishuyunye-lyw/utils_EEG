@@ -17,6 +17,7 @@ import neurora.rsa_plot
 
 import sys
 print(sys.executable)
+import datetime
 import os
 import time
 import numpy as np
@@ -40,31 +41,55 @@ from rpy2.robjects.packages import importr
 from scipy.stats import pearsonr
 from scipy.spatial.distance import pdist, squareform
 from mne_rsa import searchlight
+import numpy as np
+import pandas as pd
+import rpy2.robjects as ro
+from rpy2.robjects import pandas2ri
+from rpy2.robjects.conversion import localconverter
+import statsmodels.formula.api as smf
+import re
+import pandas as pd
+import statsmodels.formula.api as smf
+import scipy.stats
 
+import rpy2.robjects as ro
+from rpy2.robjects import pandas2ri
+from rpy2.robjects.conversion import localconverter
 
-# model_formula = 'distance ~ category + logic1 + RT1 + (1|subId)'
+# two package for parallel processing
+# ***** joblib always raise error in my computer
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from joblib import Parallel, delayed
+
+# ** compare different models
+# model_formula = 'distance ~ category_cond2 +  (1|subId_cond1)'
 model_formula = 'distance ~ category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1|subId_cond1)+ (1|wordPairs)'
+# model_formula = 'distance ~ category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1|subId_cond1)'
+# model_formula = 'distance ~ category_cond2 + (1|subId_cond1)+ (1|wordPairs)'
+# including random slope  too slope
+# model_formula = 'distance ~ category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1 + category_cond2 + RT1_cond2 | subId_cond1)'
+# model_formula = 'distance ~ category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1 + category_cond2 | subId_cond1) + (1 + category_cond2 | wordPairs)'
 
+mediator_formula = 'distance ~ category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1|subId_cond1) + (1|wordPairs)'
+outcome_formula = '(logicalScore1_cond1 - logicalScore1_cond2) ~ distance + category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1|subId_cond1) + (1|wordPairs)'
+
+# # simple model for testing
+mediator_formula = 'distance ~ category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1|subId_cond1) '
+outcome_formula = 'logicalScoreDiff ~ distance + category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1|subId_cond1)'
 
 
 # 定义一个函数来处理读取epochs的重复逻辑
 # 可以选取某些特定通道
 def load_epochs(sub_ids, list_epochs_allSubs, base_data_path, channels_field):
     '''
-
-
     读取epochs数据，并将读取的epochs对象添加到列表中。
-
-
     参数:
     sub_ids (list): 包含所有被试的ID的列表。
     list_epochs (list): 包含所有被试的epochs对象的列表。
     base_data_path (str): 数据存放路径的前缀。
     channels_all (list): 包含所有被试的通道名称的列表。
 
-
     '''
-
     for sub_id in sub_ids:
         # 为每个sub_id更新data_path
         data_path = base_data_path + sub_id + '-epo.fif'
@@ -79,6 +104,7 @@ def load_epochs(sub_ids, list_epochs_allSubs, base_data_path, channels_field):
 
         # 将读取的epochs对象添加到列表中
         list_epochs_allSubs.append(epochs_sub)
+
 
 # utils_EEG/stuff.py
 '''
@@ -117,12 +143,128 @@ def load_epochs(sub_ids, list_epochs_allSubs, base_data_path, channels_field,
         if num_epochs is not None:
             epochs_sub = epochs_sub[:num_epochs]
 
-        # Convert data to float32
-        # avoid memory problem in parallel processing.
-        epochs_sub._data = epochs_sub._data.astype(np.float32)
+        # # Convert data to float32
+        # # avoid memory problem in parallel processing.
+        # epochs_sub._data = epochs_sub._data.astype(np.float32)
 
         # Append the epochs object to the list
         list_epochs_allSubs.append(epochs_sub)
+
+# load epochs data for distance calculation(pairs)
+def load_epochs(sub_ids, base_data_path, channels_field,
+                num_epochs=None):
+    '''
+    Load epochs data for a list of subjects and optionally limit the number of epochs.
+
+    Parameters:
+    - sub_ids (list): List of subject IDs.
+    - base_data_path (str): Base path to the directory containing the epochs files.
+    - channels_field (list): List of channel names to pick from the epochs.
+    - num_epochs (int, optional): Number of epochs to load per subject. If None, load all epochs.
+
+    Returns:
+    - epochs_list (list): List containing the epochs for each subject.
+    '''
+    epochs_list = []
+
+    print(num_epochs)
+
+    for sub_id in sub_ids:
+        # Construct the file path for the subject's epochs file
+        data_path = os.path.join(base_data_path, f"{sub_id}-epo.fif")
+
+        try:
+            # Read the epochs data
+            epochs_sub = mne.read_epochs(fname=data_path, preload=True)
+        except FileNotFoundError:
+            print(f"File not found for subject {sub_id}: {data_path}")
+            continue
+        except Exception as e:
+            print(f"Error reading epochs for subject {sub_id}: {e}")
+            continue
+
+        # Pick the specified channels
+        epochs_sub.pick(picks=channels_field)
+
+        # Limit the number of epochs if num_epochs is specified
+        if num_epochs is not None:
+            epochs_sub = epochs_sub[:num_epochs]
+
+        # Convert data to float32 to avoid memory problems in parallel processing
+        # derease the memroy usage if necessary
+        epochs_sub._data = epochs_sub._data.astype(np.float32)
+
+
+        # Append the epochs object to the list
+        epochs_list.append(epochs_sub)
+
+    return epochs_list
+
+
+def load_epochs(sub_ids, base_data_path, channels_field,
+                num_epochs=None):
+    '''
+    Load epochs data for a list of subjects and optionally limit the number of epochs.
+    Additionally, check for NaN values in the metadata columns of the epochs.
+
+    Parameters:
+    - sub_ids (list): List of subject IDs.
+    - base_data_path (str): Base path to the directory containing the epochs files.
+    - channels_field (list): List of channel names to pick from the epochs.
+    - num_epochs (int, optional): Number of epochs to load per subject. If None, load all epochs.
+
+    Returns:
+    - epochs_list (list): List containing the epochs for each subject.
+    '''
+    epochs_list = []
+
+    print(f"Number of epochs to load per subject: {num_epochs}")
+
+    for sub_id in sub_ids:
+        # Construct the file path for the subject's epochs file
+        data_path = os.path.join(base_data_path, f"{sub_id}-epo.fif")
+
+        try:
+            # Read the epochs data
+            epochs_sub = mne.read_epochs(fname=data_path, preload=True)
+        except FileNotFoundError:
+            print(f"File not found for subject {sub_id}: {data_path}")
+            continue
+        except Exception as e:
+            print(f"Error reading epochs for subject {sub_id}: {e}")
+            continue
+
+        # Pick the specified channels
+        epochs_sub.pick(picks=channels_field)
+
+        # Limit the number of epochs if num_epochs is specified
+        if num_epochs is not None:
+            epochs_sub = epochs_sub[:num_epochs]
+
+        # Check for NaN values in metadata columns
+        if epochs_sub.metadata is not None:
+            # Check if any columns in metadata have NaN values
+            nan_columns = epochs_sub.metadata.columns[epochs_sub.metadata.isnull().any()].tolist()
+            if nan_columns:
+                print(f"Subject {sub_id}: NaN values found in metadata columns: {nan_columns}")
+                # Handle NaNs as desired
+                # For example, you could drop epochs with NaN in metadata
+                # epochs_sub = epochs_sub.drop(epochs_sub.metadata[epochs_sub.metadata[nan_columns].isnull().any(axis=1)].index)
+
+                # Or you could fill NaNs with default values
+                # epochs_sub.metadata = epochs_sub.metadata.fillna(value)
+
+                # Or raise an error
+                # raise ValueError(f"Subject {sub_id}: NaN values found in metadata columns: {nan_columns}")
+
+        # Convert data to float32 to avoid memory problems in parallel processing
+        # Decrease the memory usage if necessary
+        # epochs_sub._data = epochs_sub._data.astype(np.float32)
+
+        # Append the epochs object to the list
+        epochs_list.append(epochs_sub)
+
+    return epochs_list
 
 '''
 replace epochs data with power data (frequency)
@@ -172,6 +314,64 @@ def load_epochs_tfr(sub_ids, list_epochs_allSubs, base_data_path, channels_field
         # 将新的epochs对象添加到列表中
         list_epochs_allSubs.append(new_epochs)
 
+def load_epochs_tfr(sub_ids, base_data_path, channels_field, freqs, n_cycles, decim=1, average=False):
+    '''
+    Load epochs data and compute time-frequency representation using Morlet wavelets.
+
+    Parameters:
+    - sub_ids (list): List of subject IDs.
+    - base_data_path (str): Base path to the directory containing the epochs files.
+    - channels_field (list): List of channel names to pick from the epochs.
+    - freqs (array): Array of frequencies to analyze.
+    - n_cycles (int or array): Number of cycles for each frequency.
+    - decim (int): Decimation factor. Defaults to 1 (no decimation).
+    - average (bool): Whether to average the TFR results over epochs. Defaults to False.
+
+    Returns:
+    - tfr_epochs_list (list): List containing the TFR-transformed epochs for each subject.
+    '''
+
+    import os
+    import numpy as np
+    import mne
+
+    tfr_epochs_list = []
+
+    for sub_id in sub_ids:
+        data_path = os.path.join(base_data_path, f"{sub_id}-epo.fif")
+
+        try:
+            epochs_sub = mne.read_epochs(fname=data_path, preload=True)
+        except FileNotFoundError:
+            print(f"File not found for subject {sub_id}: {data_path}")
+            continue
+        except Exception as e:
+            print(f"Error reading epochs for subject {sub_id}: {e}")
+            continue
+
+        # Pick the specified channels
+        epochs_sub.pick(picks=channels_field)
+
+        # Compute TFR using Morlet wavelets
+        power = mne.time_frequency.tfr_morlet(
+            epochs_sub, freqs=freqs, n_cycles=n_cycles,
+            use_fft=True, return_itc=False, decim=decim, n_jobs=1, average=average
+        )
+
+        # Extract power data
+        power_data = power.data
+
+        # Average over the frequency dimension
+        averaged_power_data = power_data.mean(axis=2)  # Shape: (n_epochs, n_channels, n_times)
+
+        # Create new epochs with the power data
+        new_epochs = epochs_sub.copy()
+        new_epochs._data = averaged_power_data
+
+        tfr_epochs_list.append(new_epochs)
+
+    return tfr_epochs_list
+
 
 def format_channel_names(channel_names):
     """
@@ -195,6 +395,9 @@ def generate_channel_patches(file_path: str, spatial_radius: float) -> dict:
     # exclude eog!!!!
     epochs = mne.read_epochs(file_path, preload=True, )  # include eog!!!!
     epochs.drop_channels(['VEOG'])
+
+    # exclude FT9 FT10 TP9 TP10 too
+    epochs.drop_channels(['FT9', 'FT10', 'TP9', 'TP10'])
 
     # Get data shape
     shape = epochs.get_data().shape
@@ -261,8 +464,9 @@ The mix-effect model don't require same numbers of values for calculation.
 so the function below 
 '''
 
-def organize_eeg_data_by_subject_and_condition(T1_sub_ids, list_epochs_One, list_epochs_M2, list_epochs_S2,
-                                               channels_all, equalize_trials=False):
+def outdated_organize_eeg_data_by_subject_and_condition(
+        T1_sub_ids, list_epochs_One, list_epochs_M2, list_epochs_S2,
+        channels_all, equalize_trials=False):
     """
     Organizes EEG data for multiple subjects across multiple conditions, handling varying numbers of trials per condition.
 
@@ -275,10 +479,13 @@ def organize_eeg_data_by_subject_and_condition(T1_sub_ids, list_epochs_One, list
         equalize_trials (bool): If True, equalizes the number of trials across conditions by random sampling.
 
     Returns:
+
         list_subdata (list): A list where each element corresponds to one subject.
             Each subject's data is a list of arrays, one for each condition.
             Each condition array has shape (n_trials, n_channels, n_times),
             where n_trials may be equalized if equalize_trials is True.
+
+            structure:sub - condition - (n_trials, n_channels, n_times)
     """
     import numpy as np
 
@@ -333,8 +540,10 @@ We check if epochs.metadata is available. If so, we reset the index to ensure pr
 Handling Missing Metadata:
 If metadata is not available, we create a placeholder DataFrame with a 'trial_index' column.
 '''
-def organize_eeg_data_by_subject_and_condition(T1_sub_ids, list_epochs_One, list_epochs_M2, list_epochs_S2,
-                                               channels_all):
+def organize_eeg_data_by_subject_and_condition(
+        T1_sub_ids,
+        list_epochs_One, list_epochs_M2, list_epochs_S2,
+                                               ):
     """
     Organizes EEG data for multiple subjects across multiple conditions, including metadata.
 
@@ -350,7 +559,7 @@ def organize_eeg_data_by_subject_and_condition(T1_sub_ids, list_epochs_One, list
             - 'data': List of arrays for each condition, with shape (n_trials, n_channels, n_timepoints).
             - 'metadata': List of DataFrames for each condition, containing metadata for each trial.
     """
-    num_channel = len(channels_all)
+
     list_subdata = []
 
     for sub_index in range(len(T1_sub_ids)):
@@ -446,6 +655,1040 @@ def save_arrays_to_csv(results_m2, results_s2, filename_m2, filename_s2, shape):
     np.savetxt(filename_m2, array_m2, delimiter=",")
     np.savetxt(filename_s2, array_s2, delimiter=",")
 
+
+#functions for calculate distance
+
+'''
+
+part for calculate distance 
+including vectorize data and  calculate distance series 
+
+'''
+
+
+def limtozero(value):
+    """ Ensure that negative values are set to zero. """
+    return max(value, 0)
+
+
+def condition_difference_score_permutations(data, time_opt='features',
+                                            time_win=50, time_step=5,
+                                            method='correlation', use_abs=False,
+                                            return_type='all'):
+    """
+    for sigle subject? 应该是了, 否则会有 mix model
+
+    Calculate distances representing the differences between two conditions in EEG data across time windows,
+    considering all possible pairings of trials between the two conditions using specified distance metric.
+
+    Parameters:
+    - data (numpy.ndarray): The input data with shape [n_conds=2, n_trials, n_chls, n_ts]
+        where n_conds must be 2, n_trials is the number of trials, n_chls is the number of channels,
+        and n_ts is the number of time samples.
+    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
+        'features' to use the reshaped feature vectors. Default is 'features'.
+    - time_win (int): Length of the time window over which to calculate the distance.
+    - time_step (int): Step size to move the window across the time samples.
+    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
+    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
+    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
+        'all' returns an array of all computed distances per window.
+
+    Returns:
+    - numpy.ndarray: Depending on return_type, either an array of mean distances per window or a nested
+      array of all distances for each window.
+    """
+    n_trials = data.shape[1]
+    n_chls = data.shape[2]
+    n_ts = data.shape[3]
+    n_windows = (n_ts - time_win) // time_step + 1
+    results = []
+
+    for window_idx in range(n_windows):
+        start_idx = window_idx * time_step
+        end_idx = start_idx + time_win
+        data_window = data[:, :, :, start_idx:end_idx]
+
+        if time_opt == 'average':
+            data_preprocessed = data_window.mean(axis=3)
+        elif time_opt == 'features':
+            data_preprocessed = data_window.reshape(2, n_trials, n_chls * time_win)
+
+        distances = []
+        for i in range(n_trials):
+            for j in range(i + 1, n_trials):
+                if method == 'correlation':
+                    # keep original r, becasue r have a range of [-1, 1],
+                    r, _ = pearsonr(data_preprocessed[0, i], data_preprocessed[1, j])
+                    # distance = 1 - np.abs(r) if use_abs else 1 - r
+                    distance = r
+                elif method == 'euclidean':
+                    distance = np.linalg.norm(data_preprocessed[0, i] - data_preprocessed[1, j])
+                distances.append(distance)
+
+        if return_type == 'mean':
+            mean_distance = np.mean(distances)
+            results.append(mean_distance)
+        elif return_type == 'all':
+            results.append(distances)
+
+    return np.array(results)
+
+
+# Example usage:
+# data = np.random.rand(2, 10, 5, 100)  # Simulated data: [2 conditions, 10 trials, 5 channels, 100 time samples]
+# mean_distances = condition_difference_score_permutations(data, return_type='mean')
+# all_distances = condition_difference_score_permutations(data, return_type='all')
+#
+#
+'''
+update 2024年10月6日:
+To handle unequal numbers of trials between conditions.
+
+Explanation of Changes
+Separate Data for Each Condition:
+Extracted data_cond1 and data_cond2 from data.
+Now we can handle different numbers of trials for each condition.
+Adjusted Data Preprocessing:
+Applied preprocessing separately for each condition:
+Modified Nested Loops:
+Looped over trials in both conditions:
+Distance Computation:
+Computed distances between all possible pairs of trials from condition 1 and condition 2.
+Distance Metric Adjustment:
+For the correlation method, adjusted the calculation of distance based on use_abs:
+Return Value:
+The function now returns distances correctly computed over all trial pairs between conditions.
+Returned as a NumPy array for consistency.
+
+'''
+
+
+def condition_difference_score_permutations(data, time_opt='features',
+                                            time_win=50, time_step=5,
+                                            method='correlation', use_abs=False,
+                                            return_type='all'):
+    """
+    Calculate distances representing the differences between two conditions in EEG data across time windows,
+    considering all possible pairings of trials between the two conditions using specified distance metric.
+
+    Parameters:
+    - data (list or numpy.ndarray): The input data containing data for two conditions.
+        Should be a list or array with elements:
+        data[0]: Data for condition 1, shape (n_trials_cond1, n_channels, n_timepoints)
+        data[1]: Data for condition 2, shape (n_trials_cond2, n_channels, n_timepoints)
+    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
+        'features' to use the reshaped feature vectors. Default is 'features'.
+    - time_win (int): Length of the time window over which to calculate the distance.
+    - time_step (int): Step size to move the window across the time samples.
+    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
+    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
+    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
+        'all' returns an array of all computed distances per window.
+
+    Returns:
+    - numpy.ndarray: Depending on return_type, either an array of mean distances per window or a list
+      of arrays of distances for each window.
+    """
+    data_cond1 = data[0]  # Shape: (n_trials_cond1, n_channels, n_timepoints)
+    data_cond2 = data[1]  # Shape: (n_trials_cond2, n_channels, n_timepoints)
+
+    n_trials_cond1 = data_cond1.shape[0]
+    n_trials_cond2 = data_cond2.shape[0]
+    n_chls = data_cond1.shape[1]
+    n_ts = data_cond1.shape[2]
+    n_windows = (n_ts - time_win) // time_step + 1
+    results = []
+
+    for window_idx in range(n_windows):
+        start_idx = window_idx * time_step
+        end_idx = start_idx + time_win
+        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
+        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
+
+        if time_opt == 'average':
+            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)  # Shape: (n_trials_cond1, n_chls)
+            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)  # Shape: (n_trials_cond2, n_chls)
+        elif time_opt == 'features':
+            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, n_chls * time_win)
+            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, n_chls * time_win)
+
+        distances = []
+        for i in range(n_trials_cond1):
+            for j in range(n_trials_cond2):
+                if method == 'correlation':
+                    r, _ = pearsonr(data_preprocessed_cond1[i], data_preprocessed_cond2[j])
+                    if use_abs:
+                        distance = 1 - abs(r)
+                    else:
+                        # distance = 1 - r  # Inverse correlation to get distance
+                        distance = r  # the sign of r have meaning, 1-r will lose this information.
+                elif method == 'euclidean':
+                    distance = np.linalg.norm(data_preprocessed_cond1[i] - data_preprocessed_cond2[j])
+                distances.append(distance)
+
+        if return_type == 'mean':
+            mean_distance = np.mean(distances)
+            results.append(mean_distance)
+        elif return_type == 'all':
+            results.append(distances)
+
+    return np.array(results)
+
+
+'''
+update 2024年10月6日:
+Here's how we can proceed:
+Modify condition_difference_score_permutations to store trial pair indices along with the distances.
+Adjust normalize_across_comparisons_trial to handle the new output format.
+Ensure that the rest of your code can process the new data structure.
+---
+1. Modify condition_difference_score_permutations to Store Trial Pair Information
+We'll update the function to return not just the distances but also the indices of the trial pairs that were compared.
+We'll achieve this by storing tuples of (distance, trial_index_cond1, trial_index_cond2).
+
+'''
+
+
+def condition_difference_score_permutations(data, time_opt='features',
+                                            time_win=50, time_step=5,
+                                            method='correlation', use_abs=False,
+                                            return_type='all'):
+    """
+    Calculate distances representing the differences between two conditions in EEG data across time windows,
+    considering all possible pairings of trials between the two conditions using specified distance metric,
+    and keeping track of trial pairs.
+
+    Parameters:
+    - data (list or numpy.ndarray): The input data containing data for two conditions.
+        data[0]: Data for condition 1, shape (n_trials_cond1, n_channels, n_timepoints)
+        data[1]: Data for condition 2, shape (n_trials_cond2, n_channels, n_timepoints)
+    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
+        'features' to use the reshaped feature vectors. Default is 'features'.
+    - time_win (int): Length of the time window over which to calculate the distance.
+    - time_step (int): Step size to move the window across the time samples.
+    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
+    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
+    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
+        'all' returns a list of lists, each containing tuples with distances and trial indices.
+
+    Returns:
+    - If return_type is 'mean':
+        - numpy.ndarray: Array of mean distances per window.
+    - If return_type is 'all':
+        - List of lists for each window, where each inner list contains tuples:
+            (distance, trial_index_cond1, trial_index_cond2)
+    """
+    data_cond1 = data[0]  # Shape: (n_trials_cond1, n_channels, n_timepoints)
+    data_cond2 = data[1]  # Shape: (n_trials_cond2, n_channels, n_timepoints)
+
+    n_trials_cond1 = data_cond1.shape[0]
+    n_trials_cond2 = data_cond2.shape[0]
+    n_chls = data_cond1.shape[1]
+    n_ts = data_cond1.shape[2]
+    n_windows = (n_ts - time_win) // time_step + 1
+    results = []
+
+    for window_idx in range(n_windows):
+        start_idx = window_idx * time_step
+        end_idx = start_idx + time_win
+        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
+        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
+
+        if time_opt == 'average':
+            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)  # Shape: (n_trials_cond1, n_chls)
+            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)  # Shape: (n_trials_cond2, n_chls)
+        elif time_opt == 'features':
+            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, n_chls * time_win)
+            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, n_chls * time_win)
+
+        distances = []
+        for i in range(n_trials_cond1):
+            for j in range(n_trials_cond2):
+                if method == 'correlation':
+                    r, _ = pearsonr(data_preprocessed_cond1[i], data_preprocessed_cond2[j])
+                    if use_abs:
+                        distance = 1 - abs(r)
+                    else:
+                        distance = 1 - r
+                elif method == 'euclidean':
+                    distance = np.linalg.norm(data_preprocessed_cond1[i] - data_preprocessed_cond2[j])
+                # Store the distance along with the trial indices
+                distances.append((distance, i, j))
+
+        if distances:
+            if return_type == 'mean':
+                mean_distance = np.mean([d[0] for d in distances])  # Extract distances for averaging
+                results.append(mean_distance)
+            elif return_type == 'all':
+                results.append(distances)
+        else:
+            # Handle cases where no distances were calculated
+            results.append(np.nan)
+
+    return results
+
+
+'''
+return including both distances and corresponding metadata for each trial pair.
+'''
+
+
+def condition_difference_score_permutations(data, metadata=None, time_opt='features',
+                                            time_win=50, time_step=5,
+                                            method='correlation', use_abs=False,
+                                            return_type='all'):
+    """
+    Calculate distances representing the differences between two conditions in EEG data across time windows,
+    considering all possible pairings of trials between the two conditions using specified distance metric,
+    and keeping track of trial pairs and their metadata.
+
+    Parameters:
+    - data (list or numpy.ndarray): The input data containing data for two conditions.
+        data[0]: Data for condition 1, shape (n_trials_cond1, n_channels, n_timepoints)
+        data[1]: Data for condition 2, shape (n_trials_cond2, n_channels, n_timepoints)
+    - metadata (list, optional): Metadata for the two conditions, each a DataFrame.
+        metadata[0]: Metadata for condition 1, shape (n_trials_cond1, n_features)
+        metadata[1]: Metadata for condition 2, shape (n_trials_cond2, n_features)
+    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
+        'features' to use the reshaped feature vectors. Default is 'features'.
+    - time_win (int): Length of the time window over which to calculate the distance.
+    - time_step (int): Step size to move the window across the time samples.
+    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
+    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
+    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
+        'all' returns a list of lists, each containing tuples with distances and trial indices.
+
+    Returns:
+    - If return_type is 'mean':
+        - numpy.ndarray: Array of mean distances per window.
+    - If return_type is 'all':
+        - List of lists for each window, where each inner list contains tuples:
+            (distance, trial_index_cond1, trial_index_cond2, metadata_cond1, metadata_cond2)
+    """
+    data_cond1 = data[0]  # Shape: (n_trials_cond1, n_channels, n_timepoints)
+    data_cond2 = data[1]  # Shape: (n_trials_cond2, n_channels, n_timepoints)
+
+    n_trials_cond1 = data_cond1.shape[0]
+    n_trials_cond2 = data_cond2.shape[0]
+    n_chls = data_cond1.shape[1]
+    n_ts = data_cond1.shape[2]
+    n_windows = (n_ts - time_win) // time_step + 1
+    results = []
+
+    for window_idx in range(n_windows):
+        start_idx = window_idx * time_step
+        end_idx = start_idx + time_win
+        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
+        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
+
+        if time_opt == 'average':
+            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)
+            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)
+        elif time_opt == 'features':
+            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, n_chls * time_win)
+            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, n_chls * time_win)
+
+        distances = []
+        for i in range(n_trials_cond1):
+            for j in range(n_trials_cond2):
+                if method == 'correlation':
+                    r, _ = pearsonr(data_preprocessed_cond1[i], data_preprocessed_cond2[j])
+                    distance = 1 - abs(r) if use_abs else 1 - r
+                elif method == 'euclidean':
+                    distance = np.linalg.norm(data_preprocessed_cond1[i] - data_preprocessed_cond2[j])
+
+                # Retrieve metadata for the trial pairs
+                metadata_cond1 = metadata[0].iloc[i] if metadata else None
+                metadata_cond2 = metadata[1].iloc[j] if metadata else None
+
+                # Store the distance along with the trial indices and metadata
+                distances.append((distance, i, j, metadata_cond1, metadata_cond2))
+
+        if distances:
+            if return_type == 'mean':
+                mean_distance = np.mean([d[0] for d in distances])
+                results.append(mean_distance)
+            elif return_type == 'all':
+                results.append(distances)
+        else:
+            results.append(np.nan)
+
+    return results
+
+
+'''
+the core function to calculate the distance between two conditions 
+for 1 subject.
+loop over time windows - trial pair 
+'''
+
+
+def condition_difference_score_permutations(data, metadata=None, time_opt='features',
+                                            time_win=50, time_step=5,
+                                            method='correlation', use_abs=False,
+                                            return_type='all'):
+    """
+    Calculate distances representing the differences between two conditions in EEG data across time windows,
+    considering all possible pairings of trials between the two conditions using specified distance metric,
+    and keeping track of trial pairs and their metadata.
+
+    Parameters:
+    - data (list or numpy.ndarray): The input data containing data for two conditions.
+        data[0]: Data for condition 1, shape (n_trials_cond1, n_channels, n_timepoints)
+        data[1]: Data for condition 2, shape (n_trials_cond2, n_channels, n_timepoints)
+    - metadata (list, optional): Metadata for the two conditions, each a DataFrame.
+        metadata[0]: Metadata for condition 1, shape (n_trials_cond1, n_features)
+        metadata[1]: Metadata for condition 2, shape (n_trials_cond2, n_features)
+    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
+        'features' to use the reshaped feature vectors. Default is 'features'.
+    - time_win (int): Length of the time window over which to calculate the distance.
+    - time_step (int): Step size to move the window across the time samples.
+    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
+    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
+    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
+        'all' returns a list of DataFrames for each window.
+
+    Returns:
+    - If return_type is 'mean':
+        - numpy.ndarray: Array of mean distances per window.
+    - If return_type is 'all':
+        - List of DataFrames for each window, where each DataFrame contains:
+            - 'distance': Distance value
+            - Metadata columns from both conditions
+    """
+    data_cond1 = data[0]
+    data_cond2 = data[1]
+
+    n_trials_cond1 = data_cond1.shape[0]
+    n_trials_cond2 = data_cond2.shape[0]
+    n_chls = data_cond1.shape[1]
+    n_ts = data_cond1.shape[2]
+    n_windows = (n_ts - time_win) // time_step + 1
+    results = []
+
+    start_time = time.time()
+    for window_idx in range(n_windows):
+        start_idx = window_idx * time_step
+        end_idx = start_idx + time_win
+        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
+        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
+
+        if time_opt == 'average':
+            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)
+            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)
+        elif time_opt == 'features':
+            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, n_chls * time_win)
+            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, n_chls * time_win)
+
+        rows = []
+
+        for i in range(n_trials_cond1):
+            for j in range(n_trials_cond2):
+                if method == 'correlation':
+                    r, _ = pearsonr(data_preprocessed_cond1[i], data_preprocessed_cond2[j])
+                    # distance = 1 - abs(r) if use_abs else 1 - r
+                    distance = r  # the original r have meaning in this case. the sign or r.
+                elif method == 'euclidean':
+                    distance = np.linalg.norm(data_preprocessed_cond1[i] - data_preprocessed_cond2[j])
+
+                # Retrieve metadata for the trial pairs
+                metadata_cond1 = metadata[0].iloc[i] if metadata else pd.Series()
+                metadata_cond2 = metadata[1].iloc[j] if metadata else pd.Series()
+
+                # Combine distance and metadata into a single row
+                row = pd.concat([pd.Series({'distance': distance}), metadata_cond1.add_suffix('_cond1'),
+                                 metadata_cond2.add_suffix('_cond2')])
+                rows.append(row)
+        end_time = time.time()
+
+        if rows:
+            df = pd.DataFrame(rows)
+            results.append(df)
+        else:
+            results.append(pd.DataFrame())
+
+    print(f"trial pairs number: {n_trials_cond1 * n_trials_cond2}")
+    print(f"loop over time windows : {end_time - start_time:.2f} seconds")
+
+    return results
+
+
+'''
+Key Changes and Benefits
+Vectorized Computations: Replaces the nested loops with vectorized operations, significantly reducing computation time.
+Efficient Use of cdist: Utilizes scipy.spatial.distance.cdist to compute the pairwise distances between all trials in one function call.
+Avoids Unnecessary Loops and Function Calls: Eliminates the per-trial overhead of calling pearsonr and using Pandas operations inside loops.
+2. Optimize Data Structures and Memory Usage
+Avoid Growing Lists in Loops: Preallocate lists or arrays when possible. This prevents the overhead of dynamically resizing data structures.
+Efficient Metadata Handling: Instead of fetching and concatenating metadata inside loops, use indexing and vectorized operations to prepare the metadata for all combinations.
+
+notice!!!
+distance_matrix = 1 - distance_matrix
+
+'''
+from scipy.spatial.distance import cdist
+
+def condition_difference_score_permutations2(data, metadata=None, time_opt='features',
+                                            time_win=50, time_step=5,
+                                            method='correlation', use_abs=False,
+                                            return_type='all'):
+    """
+    Optimized version using vectorized computations.
+    """
+    data_cond1 = data[0]  # Shape: (n_trials_cond1, n_channels, n_timepoints)
+    data_cond2 = data[1]  # Shape: (n_trials_cond2, n_channels, n_timepoints)
+
+    n_trials_cond1, n_chls, n_ts = data_cond1.shape
+    n_trials_cond2 = data_cond2.shape[0]
+    n_windows = (n_ts - time_win) // time_step + 1
+    results = []
+
+    for window_idx in range(n_windows):
+        start_idx = window_idx * time_step
+        end_idx = start_idx + time_win
+        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
+        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
+
+        if time_opt == 'average':
+            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)
+            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)
+        elif time_opt == 'features':
+            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, -1)
+            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, -1)
+        if method == 'correlation':
+            distance_matrix = cdist(data_preprocessed_cond1, data_preprocessed_cond2, metric='correlation')
+
+            if not use_abs:
+                '''
+                When you use scipy.spatial.distance.cdist with metric='correlation', the resulting distance values indeed range from 0 to 2, not from 0 to 1. This is because the correlation distance is calculated as:
+                distance=1−correlation coefficient (r)
+                
+                so this function will return the distance between 0 and 2!
+                
+                '''
+                # Convert correlation distance back to correlation coefficient
+                distance_matrix = 1 - distance_matrix
+            else:
+                # Use absolute correlation coefficient
+                distance_matrix = 1 - np.abs(1 - distance_matrix)
+                # distance_matrix = np.abs(distance_matrix)
+
+        elif method == 'euclidean':
+            distance_matrix = cdist(data_preprocessed_cond1, data_preprocessed_cond2, metric='euclidean')
+
+        # Flatten the distance matrix for DataFrame construction
+        distances_flat = distance_matrix.flatten()
+
+        # Create indices for trials
+        idx_cond1 = np.repeat(np.arange(n_trials_cond1), n_trials_cond2)
+        idx_cond2 = np.tile(np.arange(n_trials_cond2), n_trials_cond1)
+
+        # Prepare metadata for all combinations
+        if metadata:
+            metadata_cond1 = metadata[0].iloc[idx_cond1].reset_index(drop=True)
+            metadata_cond2 = metadata[1].iloc[idx_cond2].reset_index(drop=True)
+        else:
+            metadata_cond1 = pd.DataFrame()
+            metadata_cond2 = pd.DataFrame()
+
+        # Create DataFrame
+        df = pd.DataFrame({'distance': distances_flat})
+        if not metadata_cond1.empty:
+            df = pd.concat([df, metadata_cond1.add_suffix('_cond1').reset_index(drop=True)], axis=1)
+        if not metadata_cond2.empty:
+            df = pd.concat([df, metadata_cond2.add_suffix('_cond2').reset_index(drop=True)], axis=1)
+
+        results.append(df)
+
+    return results
+
+'''
+We can add a parameter named within to control whether the function compares within
+ the same group or between two different groups
+ 
+ 
+ why I need consider about same group:
+ I need to calculate the trial consistency within the same condition,
+ 
+ Notice: The function exclude self-comparisons (diagonal elements) when within is True.
+ 
+'''
+
+def condition_difference_score_permutations2(data, metadata=None, time_opt='features',
+                                             time_win=50, time_step=5,
+                                             method='correlation', use_abs=False,
+                                             return_type='all', within=False):
+    """
+    Calculate pairwise distances within the same condition or between two conditions.
+
+    Parameters:
+    - data: List of numpy arrays for each condition.  这里是想要计算 S M 和 O 的距离
+    - metadata: Optional list of DataFrames for each condition.   有一个是 O的数据
+    - time_opt: 'average' or 'features' for data preprocessing.
+    - time_win: Length of the time window for distance calculation.
+    - time_step: Step size for moving the window.
+    - method: 'correlation' or 'euclidean' for distance calculation.
+    - use_abs: Whether to use absolute correlation values.
+    - return_type: Determines the format of the return value.
+    - within: If True, compare within the same condition; if False, compare between conditions.
+
+    Returns:
+    - List of DataFrames containing distances and metadata for each time window.
+    """
+    # Determine which data to use based on the 'within' parameter
+    if within:
+        data_cond1 = data[1]
+        data_cond2 = data[1]
+        metadata_cond1 = metadata[1] if metadata else None
+        metadata_cond2 = metadata[1] if metadata else None
+    else:
+        data_cond1 = data[0]
+        data_cond2 = data[1]
+        metadata_cond1 = metadata[0] if metadata else None
+        metadata_cond2 = metadata[1] if metadata else None
+
+    n_trials_cond1, n_chls, n_ts = data_cond1.shape
+    n_trials_cond2 = data_cond2.shape[0]
+    n_windows = (n_ts - time_win) // time_step + 1
+    results = []
+    # 对每个时间窗算 试次 vs 试次 距离。
+    for window_idx in range(n_windows):
+        # Define the start and end indices for the current time window
+        start_idx = window_idx * time_step
+        end_idx = start_idx + time_win
+
+        # Extract data for the current time window
+        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
+        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
+
+        # Preprocess data based on the specified option
+        if time_opt == 'average':
+            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)
+            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)
+        elif time_opt == 'features':
+            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, -1)
+            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, -1)
+
+        # Calculate the distance matrix： 试次数量 * 试次数量
+        if method == 'correlation':
+            distance_matrix = cdist(data_preprocessed_cond1, data_preprocessed_cond2, metric='correlation')
+            if not use_abs:
+                distance_matrix = 1 - distance_matrix
+            else:
+                distance_matrix = 1 - np.abs(1 - distance_matrix)
+        elif method == 'euclidean':
+            distance_matrix = cdist(data_preprocessed_cond1, data_preprocessed_cond2, metric='euclidean')
+
+        # Flatten the distance matrix and create trial indices
+        distances_flat = distance_matrix.flatten()
+        idx_cond1 = np.repeat(np.arange(n_trials_cond1), n_trials_cond2)
+        idx_cond2 = np.tile(np.arange(n_trials_cond2), n_trials_cond1)
+
+        # Exclude self-comparisons (diagonal elements) if within is True
+        if within:
+            non_diagonal_mask = idx_cond1 != idx_cond2
+            distances_flat = distances_flat[non_diagonal_mask]
+            idx_cond1 = idx_cond1[non_diagonal_mask]
+            idx_cond2 = idx_cond2[non_diagonal_mask]
+
+        # # Prepare metadata for all combinations
+        # if metadata_cond1 is not None and metadata_cond2 is not None:
+        #     metadata_cond1 = metadata_cond1.iloc[idx_cond1].reset_index(drop=True)
+        #     metadata_cond2 = metadata_cond2.iloc[idx_cond2].reset_index(drop=True)
+        # else:
+        #     metadata_cond1 = pd.DataFrame()
+        #     metadata_cond2 = pd.DataFrame()
+
+        # Prepare metadata for all combinations
+        if metadata_cond1 is not None and metadata_cond2 is not None:
+            # Create copies of the metadata to avoid modifying the original
+            metadata_cond1_copy = metadata_cond1.copy()
+            metadata_cond2_copy = metadata_cond2.copy()
+
+            # Select rows based on trial indices
+            metadata_cond1_selected = metadata_cond1_copy.iloc[idx_cond1].reset_index(drop=True)
+            metadata_cond2_selected = metadata_cond2_copy.iloc[idx_cond2].reset_index(drop=True)
+        else:
+            metadata_cond1_selected = pd.DataFrame()
+            metadata_cond2_selected = pd.DataFrame()
+
+        # # Construct the DataFrame for the current window
+        # df = pd.DataFrame({'distance': distances_flat})
+        # if not metadata_cond1.empty:
+        #     df = pd.concat([df, metadata_cond1.add_suffix('_cond1').reset_index(drop=True)], axis=1)
+        # if not metadata_cond2.empty:
+        #     df = pd.concat([df, metadata_cond2.add_suffix('_cond2').reset_index(drop=True)], axis=1)
+
+        # Construct the DataFrame for the current window
+        df = pd.DataFrame({'distance': distances_flat})
+
+        # Add metadata from condition 1 if available
+        if not metadata_cond1_selected.empty:
+            df = pd.concat([
+                df,
+                metadata_cond1_selected.add_suffix('_cond1').reset_index(drop=True)
+            ], axis=1)
+
+        # Add metadata from condition 2 if available
+        if not metadata_cond2_selected.empty:
+            df = pd.concat([
+                df,
+                metadata_cond2_selected.add_suffix('_cond2').reset_index(drop=True)
+            ], axis=1)
+
+        # Append the DataFrame to the results list
+        results.append(df)
+
+    return results
+
+'''
+
+
+'''
+
+
+
+def normalize_across_comparisons(data, normalize=True):
+    """
+    Compute distances for two comparisons (Cond1 vs Cond2 and Cond1 vs Cond3),
+    and optionally normalize these distances based on the global min and max from both sets.
+
+    Parameters:
+    - data: array, input data containing conditions.
+    - normalize: bool, if True, normalize the distances; if False, return raw distances.
+
+    Returns:
+    - Tuple of arrays, normalized or raw distances for the two comparisons.
+    """
+    # Extract data subsets for the two comparisons
+    cond1_vs_cond2 = np.array([data[0], data[1]])
+    cond1_vs_cond3 = np.array([data[0], data[2]])
+
+    # Calculate distances for both comparisons
+    distances1 = condition_difference_score_permutations(cond1_vs_cond2)
+    distances2 = condition_difference_score_permutations(cond1_vs_cond3)
+
+    if normalize:
+        # Combine distances to find the global min and max
+        combined_distances = np.concatenate((distances1, distances2))
+        min_distance = np.min(combined_distances)
+        max_distance = np.max(combined_distances)
+
+        # Normalize distances based on global min and max
+        if max_distance != min_distance:
+            normalized_distances1 = (distances1 - min_distance) / (max_distance - min_distance)
+            normalized_distances2 = (distances2 - min_distance) / (max_distance - min_distance)
+        else:
+            normalized_distances1 = np.zeros_like(distances1)
+            normalized_distances2 = np.zeros_like(distances2)
+
+        return normalized_distances1, normalized_distances2
+    else:
+        # Return raw distances if normalization is not requested
+        return distances1, distances2
+
+
+# Example use
+# Assuming data is your EEG dataset with the shape (3, n_trials, n_chls, n_ts)
+# data = np.random.rand(3, 100, 32, 500)  # Simulated EEG data
+# normalized_distances1, normalized_distances2 = normalize_across_comparisons(data)
+# print("Normalized scores for Condition 1 vs Condition 2:", normalized_distances1)
+# print("Normalized scores for Condition 1 vs Condition 3:", normalized_distances2)
+
+
+'''
+
+don't aveage the decoding accuracy for each trial, remain original data.
+
+
+问题，为什么要normalization？
+
+问题，为什么是在这里进行normalization？
+max对每个被试来说不同？
+
+实际上这里选得False
+'''
+
+
+def normalize_across_comparisons_trial(subdata, normalize=False):
+    """
+    Normalize and compute distances between conditions, returning DataFrames with distance and metadata.
+
+    Parameters:
+    - subdata (dict): Dictionary containing:
+        - 'data': List of data arrays for each condition.
+        - 'metadata': List of metadata DataFrames for each condition.
+    - normalize (bool): Whether to normalize distances.
+
+    Returns:
+    - df1, df2: DataFrames containing distances and metadata for the two comparisons.
+    """
+    data = subdata['data']
+    metadata = subdata['metadata']
+
+    # Extract data subsets for the two comparisons
+    cond1_vs_cond2 = [data[0], data[1]]
+    cond1_vs_cond3 = [data[0], data[2]]
+
+    # Calculate distances for both comparisons
+    df1 = condition_difference_score_permutations2(cond1_vs_cond2, metadata=[metadata[0], metadata[1]],
+                                                  return_type='all')
+    df2 = condition_difference_score_permutations2(cond1_vs_cond3, metadata=[metadata[0], metadata[2]],
+                                                  return_type='all')
+
+    if normalize:
+        # Normalize distances in each DataFrame
+        df1['distance'] = df1['distance'] / df1['distance'].max()
+        df2['distance'] = df2['distance'] / df2['distance'].max()
+
+    return df1, df2
+
+
+# Function to process data for a given set of channels
+'''
+
+process_channels
+then 
+process_field
+
+
+
+loop subjects
+'''
+import gc
+
+
+def process_channels(
+        list_epochs_One, list_epochs_M2, list_epochs_S2,
+        T1_sub_ids):
+    '''
+    # ## 数据整理 for distance
+    # 每个被试一个df,hope to 包括了 行为数据列 和 各个通道 某个时间点的信号数据列
+    #
+    # if I want to calculate based on different fields, I should only change the parameters of channels_all.
+    '''
+    # Start timing for the entire block
+    overall_start_time = time.time()
+
+    # data for specific field(4-5 channels)/patch
+    list_subdata = organize_eeg_data_by_subject_and_condition(T1_sub_ids, list_epochs_One, list_epochs_M2,
+                                                              list_epochs_S2)
+
+    n_subs = len(list_subdata)
+    # example_data = normalize_across_comparisons_trial(list_subdata[0], normalize=False)
+    # n_windows = len(example_data[0])  # Assuming each entry in the example_data is a list for each window
+
+    # Initialize lists to store lists of distances for all subjects
+    normalized_distances_all_1 = [[] for _ in range(n_subs)]
+    normalized_distances_all_2 = [[] for _ in range(n_subs)]
+
+    # Loop over each subject's data to calculate distances
+    for idx, data in enumerate(list_subdata):
+        normalized_distances1, normalized_distances2 = normalize_across_comparisons_trial(data, normalize=False)
+        normalized_distances_all_1[idx] = normalized_distances1
+        normalized_distances_all_2[idx] = normalized_distances2
+
+    # Example of accessing the first window's data for the first subject
+    # print("Distances for the first window of the first subject (Cond1 vs Cond2):", normalized_distances_all_1[0][0])
+    # print("Distances for the first window of the first subject (Cond1 vs Cond3):", normalized_distances_all_2[0][0])
+
+    # Assuming 'normalized_distances_all_1' is loaded as described, with shape [n_subs, n_wins][n_distances]
+
+    # sub_ids = T1_sub_ids
+
+    # Initialize lists to hold the dataframes for each window for both comparison sets
+    windows_dataframes_1 = []
+    windows_dataframes_2 = []
+
+    n_wins = 91  # Replace with dynamically determined value if necessary
+    sub_ids = T1_sub_ids
+
+    # to reform data structure, the distance calculation is finished before this step.
+    # no meaning but to match the requirement of former version code.
+    for window_index in range(n_wins):  # Replace 91 with n_wins if dynamically determined elsewhere
+        # Initialize lists to collect all subjects' data for the current window for both sets
+        all_subjects_data_1 = []
+        all_subjects_data_2 = []
+
+        # Gather data for each subject in this window for both sets
+        for sub_index, sub_id in enumerate(sub_ids):
+            # Get the distances for the current subject in the current window from both sets
+            distances_1 = normalized_distances_all_1[sub_index][window_index]
+            distances_2 = normalized_distances_all_2[sub_index][window_index]
+
+            sub_df_1 = distances_1
+            sub_df_2 = distances_2
+
+            # Append the DataFrames to their respective lists
+            all_subjects_data_1.append(sub_df_1)
+            all_subjects_data_2.append(sub_df_2)
+
+        # Concatenate all subjects' data into a single DataFrame for the current window for both sets
+        window_df_1 = pd.concat(all_subjects_data_1, ignore_index=True)
+        window_df_2 = pd.concat(all_subjects_data_2, ignore_index=True)
+
+        # Append the concatenated DataFrames to the lists holding windows DataFrames
+        windows_dataframes_1.append(window_df_1)
+        windows_dataframes_2.append(window_df_2)
+        '''
+    ## integrate with additional data for mix model calculation.
+
+    data strctrure: 
+
+    a list of dataframes, each dataframe contains the data for one window, and each row represents one subject's data for that window.
+
+    '''
+
+    # additional_data = pd.read_csv('I:\pycharmProject\pre10\统计和建模\\filtered_pivoted_data_2024年03月14日.csv')
+    #
+    # Merge and combine windows_dataframes_1 and windows_dataframes_2 with additional_data
+    # windows_dataframes_merged_1 = []
+    # windows_dataframes_merged_2 = []
+    #
+    # for window_df_1, window_df_2 in zip(windows_dataframes_1, windows_dataframes_2):
+    #     merged_df_1 = pd.merge(window_df_1, additional_data, on=['subId', 'category'], how='left')
+    #     windows_dataframes_merged_1.append(merged_df_1)
+    #
+    #     merged_df_2 = pd.merge(window_df_2, additional_data, on=['subId', 'category'], how='left')
+    #     windows_dataframes_merged_2.append(merged_df_2)
+    #
+    # Combine the corresponding DataFrames from merged lists vertically
+    # final_merged_dataframes = []
+    # for merged_df_1, merged_df_2 in zip(windows_dataframes_merged_1, windows_dataframes_merged_2):
+    #     final_df = pd.concat([merged_df_1, merged_df_2], ignore_index=True)
+    #     final_merged_dataframes.append(final_df)
+
+    windows_dataframes_merged_1 = []
+    windows_dataframes_merged_2 = []
+
+    for window_df_1, window_df_2 in zip(windows_dataframes_1, windows_dataframes_2):
+        # merged_df_1 = pd.merge(window_df_1, additional_data, on=['subId', 'category'], how='left')
+        windows_dataframes_merged_1.append(window_df_1)
+
+        # merged_df_2 = pd.merge(window_df_2, additional_data, on=['subId', 'category'], how='left')
+        windows_dataframes_merged_2.append(window_df_2)
+
+    # Combine the corresponding DataFrames from merged lists vertically
+    final_merged_dataframes = []
+    for merged_df_1, merged_df_2 in zip(windows_dataframes_merged_1, windows_dataframes_merged_2):
+        final_df = pd.concat([merged_df_1, merged_df_2], ignore_index=True)
+        final_merged_dataframes.append(final_df)
+
+    '''
+    ## calculate the mean just for plotting.
+
+    plot_tbyt_diff_decoding_acc need these two arrays:
+    '''
+
+    all_distances_M = []
+    all_distances_S = []
+    # Initialize a new list to store the averaged DataFrames
+    averaged_dataframes = []
+
+    # for df in final_merged_dataframes:
+    #     # Group by 'category' and 'subId' and calculate the mean
+    #     averaged_df = df.groupby(['category_cond2', 'subId_cond2']).mean().reset_index()
+    #     averaged_dataframes.append(averaged_df)
+    for df in final_merged_dataframes:
+        # Select only numeric columns for aggregation
+        numeric_df = df.select_dtypes(include=[np.number])
+        # Group by 'category_cond2' and 'subId_cond2' and calculate the mean
+        averaged_df = numeric_df.groupby([df['category_cond2'], df['subId_cond2']]).mean().reset_index()
+        # Add back non-numeric columns if needed
+        non_numeric_df = df.select_dtypes(exclude=[np.number]).drop_duplicates(subset=['category_cond2', 'subId_cond2'])
+        averaged_df = pd.merge(averaged_df, non_numeric_df, on=['category_cond2', 'subId_cond2'], how='left')
+        averaged_dataframes.append(averaged_df)
+
+    # Initialize empty lists to store distance values for both categories
+    all_distances_M = []
+    all_distances_S = []
+
+    # Loop through each DataFrame in the list
+    for df in averaged_dataframes:
+        # Filter the DataFrame for category 'M' and extract distance values
+        filtered_distances_M = df[df['category_cond2'] == 'M']['distance'].values
+        # Filter the DataFrame for category 'S' and extract distance values
+        filtered_distances_S = df[df['category_cond2'] == 'S']['distance'].values
+
+        # Append the distances to the corresponding list
+        all_distances_M.append(filtered_distances_M)
+        all_distances_S.append(filtered_distances_S)
+
+    # Horizontally stack all distance arrays from category 'M' to create a single ndarray
+    # This requires each array to have the same length
+    final_distances_array_M = np.column_stack(all_distances_M)
+
+    # Horizontally stack all distance arrays from category 'S' to create a single ndarray
+    # This requires each array to have the same length
+    final_distances_array_S = np.column_stack(all_distances_S)
+
+    # Print the resulting ndarrays
+    # print("Distances for category M:", final_distances_array_M)
+    # print("Distances for category S:", final_distances_array_S)
+
+    # End timing for the entire block
+    overall_end_time = time.time()
+    print(f"****loop all subjects: {overall_end_time - overall_start_time:.2f} seconds")
+
+    # save memory, delete the intermediate variables.
+    del list_subdata, normalized_distances_all_1, normalized_distances_all_2
+    gc.collect()
+
+    return final_distances_array_M, final_distances_array_S, final_merged_dataframes
+
+
+# Define the function to process each field
+# for one field.. convenient to parallel..
+'''
+    list_epochs_One = list()
+    list_epochs_M2 = list()
+    list_epochs_S2 = list()
+
+why we have to load data in process_field() ?
+parallel problems
+every subprcess have its own memory space, so we have to load data in each process.
+'''
+
+
+def process_field(
+        field_name,
+        field_channels,
+        T1_sub_ids, T2M_sub_ids, T2S_sub_ids, num_epochs=None, #for test
+        base_data_path = 'D:\\LYW\\pre10\\data\\6epoch_clean_allWords_fullMeta_sep\\' ):
+    ''''''
+
+
+    # test equal version organize_eeg_data_by_subject_and_condition function.
+    # base_data_path = 'D:\\LYW\\pre10\\data\\6epoch_clean_equal\\'
+
+
+    # 调用函数读取T1_sub_ids对应的数据
+    list_epochs_One = load_epochs(T1_sub_ids, base_data_path, field_channels,
+                                  num_epochs=num_epochs)
+    # 调用函数读取T2M_sub_ids对应的数据，注意添加'M'作为文件名后缀
+    list_epochs_M2 = load_epochs(T2M_sub_ids, base_data_path, field_channels,
+                                 num_epochs=num_epochs)
+    # 调用函数读取T2S_sub_ids对应的数据，注意添加'S'作为文件名后缀
+    list_epochs_S2 = load_epochs(T2S_sub_ids, base_data_path, field_channels,
+                                 num_epochs=num_epochs)
+
+    print(f"Processing {field_name} with channels {field_channels}")
+    result_M, result_S, merged_dataframes = process_channels(
+        list_epochs_One, list_epochs_M2, list_epochs_S2,
+         T1_sub_ids,
+    )
+
+    del list_epochs_One, list_epochs_M2, list_epochs_S2
+
+    gc.collect()
+
+    return field_name, result_M, result_S, merged_dataframes
+
+
+#%%
+
+
 '''
 why don't use package of python?
 
@@ -524,22 +1767,19 @@ def fit_lmer_model_R(data, formula=None):
 '''
 for hat+tfce clustering
 
-I need to add sigma parameter ..
+this function don't return t value, but return coef_estimate, std_error which is 
+used to calculate t value. 
+
+then in the next function, I will corrected coef_estimate, std_error basing on hat idea..
+
+the difference from former function is that 
+the return value is coef_estimate, std_error, but not t_value, p_value
 
 It is hard to add hat to mixmodel ... 
 this function is not right need to change it...
 
-
-the difference from former function is that 
-the return value is coef_estimate, std_error, but not t_value, p_value
+正是因为yao hat smooth t value, 所以返回值才不是直接的t value, 而是coef_estimate, std_error
 '''
-
-import numpy as np
-import pandas as pd
-import rpy2.robjects as ro
-from rpy2.robjects import pandas2ri
-from rpy2.robjects.conversion import localconverter
-
 def fit_lmer_model_R_hat(data, formula=None, term='category_cond2S'):
     """
     Fits a linear mixed effects model to the data using R's lmerTest package, with proportional variance adjustment
@@ -568,29 +1808,6 @@ def fit_lmer_model_R_hat(data, formula=None, term='category_cond2S'):
     # Pass the data to the R environment
     ro.globalenv['r_data'] = r_data
 
-    # # Use efficient conversion and avoid keeping unnecessary data in memory
-    # r_output = ro.r(f'''
-    #         library(lmerTest)
-    #         fit <- lmer({formula}, r_data)
-    #         model_summary <- summary(fit)
-    #         coef_estimate <- model_summary$coefficients["categoryS", "Estimate"]
-    #         std_error <- model_summary$coefficients["categoryS", "Std. Error"]
-    #         t_value <- model_summary$coefficients["categoryS", "t value"]
-    #         p_value <- model_summary$coefficients["categoryS", "Pr(>|t|)"]
-    #         c(coef_estimate, std_error, t_value, p_value)
-    #         ''')
-
-    # r_output = ro.r(f'''
-    #         library(lmerTest)
-    #         fit <- lmer({formula}, r_data)
-    #         model_summary <- summary(fit)
-    #         coef_estimate <- model_summary$coefficients["categoryS", "Estimate"]
-    #         std_error <- model_summary$coefficients["categoryS", "Std. Error"]
-    #         t_value <- model_summary$coefficients["categoryS", "t value"]
-    #         p_value <- model_summary$coefficients["categoryS", "Pr(>|t|)"]
-    #         c(coef_estimate, std_error, t_value, p_value)
-    #         ''')
-
     # Construct the R code, inserting the term variable
     r_output = ro.r(f'''
             library(lmerTest)
@@ -609,9 +1826,217 @@ def fit_lmer_model_R_hat(data, formula=None, term='category_cond2S'):
     # r_t_value = r_output[2]
     # p_value = r_output[3]
 
+    return coef_estimate, std_error
 
+'''
+I want connect all things together
+
+from learning category to distance to logical score of final test
+
+
+Mediator Model
+mediator_model <- lmer(distance ~ category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1|subId_cond1) + (1|wordPairs), data = your_data)
+
+Outcome Model
+outcome_model <- lmer((logicalScore1_cond1 - logicalScore1_cond2) ~ distance + category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1|subId_cond1) + (1|wordPairs), data = your_data)
+
+Mediation Analysis
+mediation_result <- mediate(mediator_model, outcome_model, treat = "category_cond2", mediator = "distance", boot = TRUE, sims = 1000)
+
+
+'''
+def fit_mediation_model_R_hat(
+    data,
+    mediator_formula,
+    outcome_formula,
+    term='category_cond2S',  # The term for which to extract coefficients # independence var you really care about.
+    model='mediator'        # Choose 'mediator' or 'outcome' model
+):
+    """
+    Fits mediator and outcome models and returns the coefficient estimate and standard error for a specified term.
+
+    Parameters:
+    - data: Pandas DataFrame containing the data.
+    - mediator_formula: A string representing the mediator model formula in R's syntax.
+    - outcome_formula: A string representing the outcome model formula in R's syntax.
+    - term: The term for which to extract the coefficient and standard error.
+    - model: Which model to extract the term from ('mediator' or 'outcome').
+
+    Returns:
+    - coef_estimate: The coefficient estimate for the specified term.
+    - std_error: The standard error for the specified term.
+    """
+
+
+    # Activate the pandas to R conversion
+    pandas2ri.activate()
+
+    # Drop rows with missing values in place to avoid copying the data
+    data.dropna(inplace=True)
+
+    # Set R's temporary directory to save memory
+    ro.r('Sys.setenv(TMPDIR = "D:/temp")')
+
+    # Convert the Pandas DataFrame to an R DataFrame
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        r_data = ro.conversion.py2rpy(data)
+
+    # Pass the data to the R environment
+    ro.globalenv['r_data'] = r_data
+
+    # Load necessary R libraries
+    ro.r('library(lme4)')
+    ro.r('library(lmerTest)')  # For p-values in mixed models
+
+    # Build the mediator model
+    ro.r(f'mediator_model <- lmer({mediator_formula}, data = r_data)')
+
+    # Build the outcome model
+    ro.r(f'outcome_model <- lmer({outcome_formula}, data = r_data)')
+
+    # Select the model from which to extract the term
+    if model == 'mediator':
+        ro.r('model_summary <- summary(mediator_model)')
+    elif model == 'outcome':
+        ro.r('model_summary <- summary(outcome_model)')
+    else:
+        raise ValueError("Parameter 'model' must be either 'mediator' or 'outcome'.")
+
+    # Extract coefficient estimate and standard error for the specified term
+    r_output = ro.r(f'c(model_summary$coefficients["{term}", "Estimate"], model_summary$coefficients["{term}", "Std. Error"])')
+
+    # Extract values from R output
+    coef_estimate = r_output[0]
+    std_error = r_output[1]
 
     return coef_estimate, std_error
+
+'''
+
+Explanation:
+
+Expressions on the Left-Hand Side: In R's formula syntax, the left-hand side (LHS) of the formula should be a single variable name, not an expression.
+Impact on Model Fitting: Using an expression like (logicalScore1_cond1 - logicalScore1_cond2) can cause errors when fitting the model with lmer, and may not be compatible with the mediate function.
+---
+
+refine by o1
+
+----
+
+mediation analysis
+not outcome model and mediator model
+but return acme directly
+
+
+'''
+
+
+
+'''
+Understanding the Error
+mediate Function Limitations:
+
+The mediate function does not support multilevel models (i.e., models with random effects).
+It is designed to work with models fitted using functions like lm, glm, svyglm, but not with mixed-effects models from lmer or glmer.
+Your Models:
+
+You're fitting your mediator and outcome models using lmer, which includes random effects (1|subId_cond1) and (1|wordPairs).
+These random effects introduce hierarchical structure (more than two levels), which mediate cannot handle.
+
+Why Use brms?
+Supports Multilevel Models: brms can handle models with random effects, which is essential for your data that includes random intercepts for subjects and items.
+Bayesian Framework: Provides a flexible Bayesian approach, allowing for estimation of uncertainty and credible intervals.
+Syntax Similarity: The formula syntax in brms is similar to that in lme4, making it easier to adapt your existing models.
+
+
+亮哥： too slow
+'''
+'''
+lavaan package
+'''
+
+
+def fit_mediation_model_R_lavaan_single_random_effect(
+        data,
+        treat='category_cond2',
+        mediator='distance',
+        outcome='logicalScoreDiff',
+        group='subId_cond1',
+        bootstrap_samples=1000
+):
+    """
+    使用 lavaan 进行单一随机效应中介模型拟合，并返回 AMCE（间接效应）。
+
+    参数:
+    - data: Pandas DataFrame，包含所有必要的变量。
+    - treat: 处理变量的列名。
+    - mediator: 中介变量的列名。
+    - outcome: 结果变量的列名。
+    - group: 随机效应分组变量的列名。
+    - bootstrap_samples: 引导样本数量，用于置信区间估计。
+
+    返回:
+    - amce: lavaan 模型的 AMCE（间接效应）值。
+    """
+    import rpy2.robjects as ro
+    from rpy2.robjects.packages import importr
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+    from rpy2.rinterface_lib.embedded import RRuntimeError
+
+    # Activate Pandas to R conversion
+    pandas2ri.activate()
+
+    # Ensure treatment variable is categorical
+    data[treat] = data[treat].astype('category')
+
+    # Drop NA values for required columns
+    required_columns = [treat, mediator, outcome, group]
+    data_clean = data.dropna(subset=required_columns).copy()
+
+    # Convert DataFrame to R format
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        r_data = ro.conversion.py2rpy(data_clean)
+
+    # Load lavaan package
+    try:
+        lavaan = importr('lavaan')
+    except:
+        utils = importr('utils')
+        utils.install_packages('lavaan')
+        lavaan = importr('lavaan')
+
+    # Define the model syntax
+    model = f'''
+    distance ~ a*{treat} + logicalScore1_cond2 + RT1_cond2
+    logicalScoreDiff ~ b*distance + c_prime*{treat} + logicalScore1_cond2 + RT1_cond2
+
+    indirect := a * b
+    total := c_prime + (a * b)
+    '''
+
+    # Fit the model
+    sem = ro.r['sem']
+    try:
+        fit = sem(
+            model=model,
+            data=r_data,
+            se='bootstrap',
+            bootstrap=bootstrap_samples,
+            cluster=group
+        )
+    except RRuntimeError as e:
+        print("Error during model fitting:", e)
+        return None
+
+    # Extract AMCE from parameter estimates
+    parameter_estimates = lavaan.parameterEstimates(fit)
+    labels = list(parameter_estimates.rx2('label'))
+    amce_index = labels.index('indirect')
+    amce_value = parameter_estimates.rx2('est')[amce_index]
+
+    return amce_value
+
 
 '''
 oudated method to smooth t value
@@ -679,16 +2104,10 @@ def fit_lmer_model_inflate(data, formula=None, inflate_variance=True, variance_t
 
     return x[0], x[1]
 
-
-
-# Example usage:
-# fit_lmer_model(data, formula="response ~ category + (1|subject)", inflate_variance=True, variance_threshold=1e-6)
-
-
 '''
-I need df(ziyoudu) to calculate t-threshold
+I need df(degree of freedom) to calculate t-threshold
 '''
-import scipy.stats
+
 def fit_lmer_model_t_threshold(data, formula, alpha=0.05):
     """
     Calculates the critical t-threshold for a given alpha level using R's lmerTest package.
@@ -736,11 +2155,7 @@ def fit_lmer_model_t_threshold(data, formula, alpha=0.05):
 the former version basing on R is too slow, so I need to change it to python version
 
 '''
-import statsmodels.formula.api as smf
-import re
-import pandas as pd
-import statsmodels.formula.api as smf
-import scipy.stats
+
 
 '''
 maybe this is wrong..
@@ -949,7 +2364,7 @@ t_value, _ = fit_lmer_model_py(df, model_formula)
 # Loop over the ndarray and apply the model
 # add a progress bar.
 from tqdm import tqdm  # Import the tqdm library
-def apply_lmer_models_to_array(array_of_dfs, model_formula = 'distance ~ category + logic1 + RT1 + (1|subId)'):
+def apply_lmer_models_to_array(array_of_dfs, model_formula):
     """
     Applies a linear mixeAd-effects model to each DataFrame stored in a 1D ndarray.
 
@@ -978,10 +2393,18 @@ def apply_lmer_models_to_array(array_of_dfs, model_formula = 'distance ~ categor
             results[j] = np.nan  # Use NaN for failed model fittings
 
     return results
+'''
+_hat function - smooth the t value
 
+correct(smooth) t value: 
+    max_std_error = np.max(results_std_error)
+    results_t_original = results_coef_estimate / (results_std_error+max_std_error*sigma)
+    results_t_smooth = results_coef_estimate / (results_std_error+max_std_error*sigma)
+
+'''
 def apply_lmer_models_to_array_hat(
         array_of_dfs,
-        model_formula = 'distance ~ category + logic1 + RT1 + (1|subId)',
+        model_formula,
         sigma = 0.001
                                    ):
     """
@@ -1015,12 +2438,12 @@ def apply_lmer_models_to_array_hat(
             results_coef_estimate[j] = np.nan  # Use NaN for failed model fittings
     max_std_error = np.max(results_std_error)
 
-    results_t_original = results_coef_estimate / (results_std_error+max_std_error*sigma)
+    results_t_original = results_coef_estimate / results_std_error
     results_t_smooth = results_coef_estimate / (results_std_error+max_std_error*sigma)
 
     # Store the results outside for comparison
-    np.save('results_t_original.npy', results_t_original)
-    np.save('results_t_smooth.npy', results_t_smooth)
+    # np.save('results_t_original.npy', results_t_original)
+    # np.save('results_t_smooth.npy', results_t_smooth)
 
     return results_t_smooth
 
@@ -1117,18 +2540,11 @@ def process_single_dataframe(df, model_formula):
         print(f"DataFrame that caused the error:\n{df}")
         return np.nan
 
-
-from joblib import Parallel, delayed
-import os
-# Calculate the number of cores to use, leaving 2 cores free
-total_cores = os.cpu_count()
-n_jobs = max(1, total_cores - 3)  # Ensure at least 2 core is used
-# 设置 JOBLIB_TEMP_FOLDER 环境变量 to avoid too much C: drive usage
 '''
 log the index and DataFrame that caused the NaN value:
 '''
 
-def apply_lmer_models_to_array_parallel(array_of_dfs, model_formula = model_formula, n_jobs=n_jobs):
+def apply_lmer_models_to_array_parallel(array_of_dfs, model_formula = model_formula, n_jobs=1):
     """
     Applies a linear mixed-effects model to each DataFrame stored in a 1D ndarray in parallel.
 
@@ -1141,10 +2557,10 @@ def apply_lmer_models_to_array_parallel(array_of_dfs, model_formula = model_form
     Returns:
     - ndarray of shape (5733,) containing the t-values from the model fitting.
     """
-    print('parallel')
     test_iterations = 100
     # Initialize an array to store the t-values, array_of_dfs has shape (1, 5733)
-    results = Parallel(n_jobs=n_jobs, temp_folder=r'D:\LYW\buff4parallel')(
+    # give more memory to avoid memory error in parallel processing
+    results = Parallel(n_jobs=n_jobs, temp_folder=r'G:\buff4Rparallel')(
         delayed(process_single_dataframe)(array_of_dfs[0, j], model_formula)
         # for j in tqdm(range(array_of_dfs.shape[1]), desc="Processing DataFrames")
         for j in tqdm(range(min(test_iterations, array_of_dfs.shape[1])), desc="Processing DataFrames")
@@ -1191,9 +2607,9 @@ def process_single_dataframe_hat(df, model_formula):
         return np.nan, np.nan
 
 def apply_lmer_models_to_array_parallel_hat(array_of_dfs,
-                                            model_formula= model_formula,
+                                            model_formula,
                                             sigma=0.001,
-                                            n_jobs=n_jobs):
+                                            n_jobs=1):
     """
     Applies a linear mixed-effects model to each DataFrame stored in a 1D ndarray in parallel.
 
@@ -1251,22 +2667,26 @@ def apply_lmer_models_to_array_parallel_hat(array_of_dfs,
     return results_t_smooth
 
 '''
+calculate the t-value for each DataFrame in parallel using the R package lme4.
+
+for all temperal-spatial points.
 
  refine the parallel version of your function 
  to include a limit on the number of iterations for testing 
  and to handle keyboard interrupts gracefully.
 
+iteration means the number of times the model is run on each DataFrame.
+5733 = times(91) * channels(63)
+
 '''
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from joblib import Parallel, delayed
 
-model_formula = \
-    'distance ~ category_cond2 + logicalScore1_cond2 + RT1_cond2 + (1|subId_cond1) + (1|wordPairs)'
-# model_formula='distance ~ category + logic1 + RT1 + (1|subId)',
 
+# for formal calculation, set test_iterations greater than n_times*n_channels(91 * 63 = 5733 for example/)
 def apply_lmer_models_to_array_parallel_hat(array_of_dfs,
-                                            model_formula= model_formula
-                                    # for formal calculation, set test_iterations greater than n_times*n_channels(91 * 63 = 5733 for example/)
+                                            model_formula = model_formula ,
+                                            test_iterations = 5733,
+                                            max_workers = 5,
+                                            sigma=0.001, # if sigma = 0, then no smoothing is applied
                                             ):
     """
     Applies a linear mixed-effects model to each DataFrame stored in a 1D ndarray in parallel.
@@ -1281,10 +2701,11 @@ def apply_lmer_models_to_array_parallel_hat(array_of_dfs,
     Returns:
     - ndarray of shape (5733,) containing the t-values from the model fitting.
     """
-    print('Starting parallel processing 15点35分')
-    sigma = 0.0001
-    test_iterations = 100000
+    # print max_worker
+    # print datetime
+    print('Starting parallel processing:'+datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
+    # Parallel package raise error..
     # Use Parallel to process DataFrames in parallel
     # Collect results as list of tuples (coef_estimate, std_error)
     # try:
@@ -1303,7 +2724,7 @@ def apply_lmer_models_to_array_parallel_hat(array_of_dfs,
 
     results = []
     # Use ProcessPoolExecutor for parallel processing
-    with ProcessPoolExecutor(max_workers=7) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(process_single_dataframe_hat, array_of_dfs[0, j], model_formula)
             for j in tqdm(range(min(test_iterations, array_of_dfs.shape[1])), desc="Processing DataFrames")
@@ -1355,6 +2776,488 @@ def apply_lmer_models_to_array_parallel_hat(array_of_dfs,
 # Example usage with a limited number of iterations for testing
 # array_of_dfs = ...  # Your ndarray of DataFrames
 # results = apply_lmer_models_to_array_parallel_hat(array_of_dfs, test_iterations=10)
+'''
+version: loads data outside.
+
+Loads coefficient estimates and standard errors from a CSV file and computes smoothed t-values.
+
+data calculated in R(positron), I just need to read the csv file and compute the t-values.
+
+'''
+# csv file path
+# default csv file path: summary_results_2024年11月14日.csv
+# csv_file_path = "G:\8 temporal-spatial\sub28\summary_results_2024年11月14日.csv"
+# csv_file_path = "G:\8 temporal-spatial\sub28_within\summary_coef_std_20241117_201349.csv"
+# csv_file_path = "G:\8 temporal-spatial\sub28_within_OnceMassed\summary_coef_std_20241125_021041.csv"
+# csv_file_path = "G:\8 temporal-spatial\sub28_within_OnceSpaced\summary_coef_std_20241127_094231.csv"
+csv_file_path = "D:\LYW\pre10\data\8 temporal-spatial\sub28\summary_coef_std_20250328_120708.csv"
+# 这个对应的公式修改了 logicalScore1Diff + RT1Diff
+# formula <- 'distance ~ category_cond2 + logicalScore1Diff + RT1Diff + (1|subId_cond1) '
+csv_file_path = "D:\LYW\pre10\data\8 temporal-spatial\sub28/summary_coef_std_20250704_133507.csv"
+
+# csv_file_path = "D:\LYW\pre10\data\permutation_summary_between\summary_results_permutation_1000.csv"
+
+# test permutation
+# I want to have a guess, the range of the t-values/ tfce? how to compare
+# I should compare t or tfce??
+
+# csv_file_path = "D:\LYW\pre10\data\8 temporal-spatial\sub28\permutation\summary_results_permutation_01.csv"
+# the parameter are not been used...except sigma..
+# this version just load coef and std from csv file and don't fit model
+def apply_lmer_models_to_array_parallel_hat(
+                                            array_of_dfs,
+                                            model_formula = model_formula ,
+                                            test_iterations = 5733,
+                                            max_workers = 5,
+                                            sigma=0.01,
+                                            csv_file_path = csv_file_path
+        ):
+    """
+    ** the parameter I don't use but I need to keep the same as the previous function.
+
+
+    Loads coefficient estimates and standard errors from a CSV file and computes smoothed t-values.
+
+    Parameters:
+    - csv_file_path: str, path to the CSV file containing the data.
+    - sigma: float, smoothing parameter.
+
+    Returns:
+    - ndarray containing the smoothed t-values.
+    """
+    print('***Loading t values from CSV***, set globally before apply_lmer_models_to_array_parallel_hat')
+    print(csv_file_path)
+
+    # Load data from CSV
+    data = pd.read_csv(csv_file_path)
+
+    # Correct sorting: Sort by 'temporal_order' first, then 'field_order'
+    data.sort_values(by=['temporal_order', 'field_order'], inplace=True)
+
+    # Extract coefficient estimates and standard errors
+    coef_estimates = data['coef_estimate'].values
+    std_errors = data['std_error'].values
+
+    # Compute max_std_error while ignoring NaNs
+    max_std_error = np.nanmax(std_errors)
+    print(f"Max std_error (ignoring NaNs): {max_std_error}")
+
+    # Compute t-values, adding smoothing to avoid division by zero
+    denominator = std_errors + max_std_error * sigma
+    results_t_original = coef_estimates / std_errors
+    results_t_smooth = coef_estimates / denominator
+
+    # Save the results
+    # np.save('results_t_original.npy', results_t_original)
+    # np.save('results_t_smooth.npy', results_t_smooth)
+    print('Results saved to results_t_original.npy and results_t_smooth.npy')
+
+    return results_t_smooth
+
+
+'''
+sequencial version for mediation model for testing.
+'''
+
+def apply_mediation_models_to_array_sequential_hat(
+    array_of_dfs,
+    mediator_formula = mediator_formula,
+    outcome_formula = outcome_formula,
+    term='category_cond2S', # S是因为summary返回的时候，虚拟编码按照alphabet
+    model='mediator',
+    test_iterations=5733,
+    sigma=0.001  # If sigma = 0, then no smoothing is applied
+):
+    """
+    Applies a mediation model to each DataFrame stored in a 1D ndarray sequentially.
+
+    Parameters:
+        - array_of_dfs: ndarray, shape (1, n) containing pandas DataFrames.
+        - mediator_formula: str, formula for the mediator model.
+        - outcome_formula: str, formula for the outcome model.
+        - term: str, the term for which to extract the coefficient and standard error.
+        - model: str, which model to extract the term from ('mediator' or 'outcome').
+        - test_iterations: int, number of iterations to run.
+        - sigma: float, smoothing parameter.
+
+    Returns:
+    - ndarray of shape (n,) containing the t-values from the model fitting.
+    """
+
+    print('Starting sequential processing: ' + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    results = []
+    n_dfs = min(test_iterations, array_of_dfs.shape[1])
+
+    # Sequential processing of DataFrames
+    for j in tqdm(range(n_dfs), desc="Processing DataFrames"):
+        try:
+            coef_estimate, std_error = process_single_dataframe_hat_mediation(
+                array_of_dfs[0, j],
+                mediator_formula,
+                outcome_formula,
+                term,
+                model
+            )
+            results.append((coef_estimate, std_error))
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            results.append((np.nan, np.nan))
+
+    # Initialize arrays to store the results
+    coef_estimates = np.zeros(n_dfs, dtype=float)
+    std_errors = np.zeros(n_dfs, dtype=float)
+
+    # Unpack results into separate arrays
+    for idx, (coef_estimate, std_error) in enumerate(results):
+        if np.isnan(coef_estimate) or np.isnan(std_error):
+            print(f"NaN value found at index {idx}")
+            print(f"DataFrame at index {idx}:\n{array_of_dfs[0, idx]}")
+            # Export the DataFrame to an Excel file for inspection
+            df_with_nan = array_of_dfs[0, idx]
+            df_with_nan.to_excel(f"DataFrame_with_NaN_at_index_{idx}.xlsx", index=False)
+            print(f"DataFrame with NaN exported to DataFrame_with_NaN_at_index_{idx}.xlsx")
+            coef_estimates[idx] = np.nan
+            std_errors[idx] = np.nan
+        else:
+            coef_estimates[idx] = coef_estimate
+            std_errors[idx] = std_error
+
+    # Compute max_std_error while ignoring NaNs
+    max_std_error = np.nanmax(std_errors)
+    print(f"Max std_error (ignoring NaNs): {max_std_error}")
+
+    # Compute t-values, adding smoothing to avoid division by zero
+    denominator = std_errors + max_std_error * sigma
+    results_t_original = coef_estimates / std_errors
+    results_t_smooth = coef_estimates / denominator
+
+    # Save the results
+    np.save('results_t_original.npy', results_t_original)
+    np.save('results_t_smooth.npy', results_t_smooth)
+    print('Results saved to results_t_original.npy and results_t_smooth.npy')
+
+    return results_t_smooth
+
+
+'''
+change code for mediation formula situation.
+
+'''
+def process_single_dataframe_hat_mediation(df, mediator_formula, outcome_formula, term='category_cond2', model='mediator'):
+    """Helper function to process a single DataFrame using the mediation model."""
+    try:
+        # Log the shape of the DataFrame
+        print(f"Processing DataFrame with shape: {df.shape}")
+
+        # Compute coef_estimate and std_error using fit_mediation_model_R_hat
+        coef_estimate, std_error = fit_mediation_model_R_hat(
+            data=df,
+            mediator_formula=mediator_formula,
+            outcome_formula=outcome_formula,
+            term=term,
+            model=model
+        )
+        return coef_estimate, std_error
+    except Exception as e:
+        # Log the exception and the DataFrame that caused it
+        print(f"Error processing DataFrame: {e}")
+        print(f"DataFrame that caused the error:\n{df}")
+        return np.nan, np.nan
+
+
+def apply_mediation_models_to_array_parallel_hat(
+    array_of_dfs,
+    mediator_formula=mediator_formula,
+    outcome_formula =outcome_formula,
+    term='category_cond2S', # S是因为summary返回的时候，虚拟编码按照alphabet
+    model='outcome', # 'outcome' or'mediator'
+    test_iterations=5733,
+    max_workers=7,
+    sigma=0.001  # If sigma = 0, then no smoothing is applied
+):
+    """
+    Applies a mediation model to each DataFrame stored in a 1D ndarray in parallel.
+
+    Parameters:
+        - array_of_dfs: ndarray, shape (1, n) containing pandas DataFrames.
+        - mediator_formula: str, formula for the mediator model.
+        - outcome_formula: str, formula for the outcome model.
+        - term: str, the term for which to extract the coefficient and standard error.
+        - model: str, which model to extract the term from ('mediator' or 'outcome').
+        - test_iterations: int, number of iterations to run.
+        - max_workers: int, number of parallel workers.
+        - sigma: float, smoothing parameter.
+
+    Returns:
+    - ndarray of shape (n,) containing the t-values from the model fitting.
+    """
+
+    print('Starting parallel processing: ' + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    results = []
+    n_dfs = min(test_iterations, array_of_dfs.shape[1])
+
+    # Use ProcessPoolExecutor for parallel processing
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                process_single_dataframe_hat_mediation,
+                array_of_dfs[0, j],
+                mediator_formula,
+                outcome_formula,
+                term,
+                model
+            )
+            for j in tqdm(range(n_dfs), desc="Processing DataFrames")
+        ]
+
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                print(f"An error occurred: {e}")
+                results.append((np.nan, np.nan))
+
+    # Initialize arrays to store the results
+    coef_estimates = np.zeros(n_dfs, dtype=float)
+    std_errors = np.zeros(n_dfs, dtype=float)
+
+    # Unpack results into separate arrays
+    for idx, (coef_estimate, std_error) in enumerate(results):
+        if np.isnan(coef_estimate) or np.isnan(std_error):
+            print(f"NaN value found at index {idx}")
+            print(f"DataFrame at index {idx}:\n{array_of_dfs[0, idx]}")
+            # Export the DataFrame to an Excel file for inspection
+            df_with_nan = array_of_dfs[0, idx]
+            df_with_nan.to_excel(f"DataFrame_with_NaN_at_index_{idx}.xlsx", index=False)
+            print(f"DataFrame with NaN exported to DataFrame_with_NaN_at_index_{idx}.xlsx")
+            coef_estimates[idx] = np.nan
+            std_errors[idx] = np.nan
+        else:
+            coef_estimates[idx] = coef_estimate
+            std_errors[idx] = std_error
+
+    # Compute max_std_error while ignoring NaNs
+    max_std_error = np.nanmax(std_errors)
+    print(f"Max std_error (ignoring NaNs): {max_std_error}")
+
+    # Compute t-values, adding smoothing to avoid division by zero
+    denominator = std_errors + max_std_error * sigma
+    results_t_original = coef_estimates / std_errors
+    results_t_smooth = coef_estimates / denominator
+
+    # Save the results
+    np.save('results_t_original.npy', results_t_original)
+    np.save('results_t_smooth.npy', results_t_smooth)
+    print('Results saved to results_t_original.npy and results_t_smooth.npy')
+
+    return results_t_smooth
+
+'''
+ACME 
+'''
+# def process_single_dataframe_hat_mediation_ACME(df, mediator_formula, outcome_formula, treat='category_cond2', mediator='distance'):
+#     """Helper function to process a single DataFrame using the mediation model."""
+#     try:
+#         # Log the shape of the DataFrame
+#         print(f"Processing DataFrame with shape: {df.shape}")
+#
+#         # Compute ACME using fit_mediation_model_R_hat
+#         acme = fit_mediation_model_R_ACME(
+#             data=df,
+#             mediator_formula=mediator_formula,
+#             outcome_formula=outcome_formula,
+#             treat=treat,
+#             mediator=mediator
+#         )
+#         return acme
+#     except Exception as e:
+#         # Log the exception and the DataFrame that caused it
+#         print(f"Error processing DataFrame: {e}")
+#         print(f"DataFrame that caused the error:\n{df}")
+#         return np.nan
+'''
+with out smooth, because we use AMCE here.
+
+'''
+def apply_mediation_models_to_array_parallel_ACME(
+    array_of_dfs,
+    mediator_formula=mediator_formula,
+    outcome_formula=outcome_formula,
+    treat='category_cond2', # heer you don't need S,because you don't use summary
+    mediator='distance',
+    test_iterations=5733,
+    max_workers=7
+):
+    """
+    Applies a mediation model to each DataFrame stored in a 1D ndarray in parallel and collects the ACME values.
+
+    Parameters:
+        - array_of_dfs: ndarray, shape (1, n) containing pandas DataFrames.
+        - mediator_formula: str, formula for the mediator model.
+        - outcome_formula: str, formula for the outcome model.
+        - treat: str, the treatment variable in the mediation analysis.
+        - mediator: str, the mediator variable in the mediation analysis.
+        - test_iterations: int, number of iterations to run.
+        - max_workers: int, number of parallel workers.
+
+    Returns:
+        - ndarray of shape (n,) containing the ACME values from the mediation analysis.
+    """
+
+    print('Starting parallel processing: ' + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    results = []
+    n_dfs = min(test_iterations, array_of_dfs.shape[1])
+
+    # Use ProcessPoolExecutor for parallel processing
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                process_single_dataframe_hat_mediation_ACME,
+                array_of_dfs[0, j],
+                mediator_formula,
+                outcome_formula,
+                treat,
+                mediator
+            )
+            for j in tqdm(range(n_dfs), desc="Processing DataFrames")
+            # # test range(2,5)
+            # for j in tqdm(range(2,7), desc="Processing DataFrames")
+        ]
+
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                print(f"An error occurred: {e}")
+                results.append(np.nan)
+
+    # Convert results to a NumPy array
+    acme_values = np.array(results, dtype=float)
+
+    # Handle NaN values
+    nan_indices = np.isnan(acme_values)
+    if np.any(nan_indices):
+        print(f"NaN values found at indices: {np.where(nan_indices)[0]}")
+        # Optionally, save the DataFrames that caused NaNs for inspection
+        for idx in np.where(nan_indices)[0]:
+            df_with_nan = array_of_dfs[0, idx]
+            df_with_nan.to_excel(f"DataFrame_with_NaN_at_index_{idx}.xlsx", index=False)
+            print(f"DataFrame with NaN exported to DataFrame_with_NaN_at_index_{idx}.xlsx")
+
+    # Save the ACME results
+    np.save('acme_values.npy', acme_values)
+    print('ACME values saved to acme_values.npy')
+
+    return acme_values
+'''
+sequential version for ACME model for testing.
+'''
+def apply_mediation_models_to_array_sequential_ACME(
+    array_of_dfs,
+    mediator_formula = mediator_formula,
+    outcome_formula = outcome_formula,
+    treat='category_cond2',
+    mediator='distance',
+    test_iterations=5733
+):
+    """
+    Applies a mediation model to each DataFrame stored in a 1D ndarray sequentially and collects the ACME values.
+
+    Parameters:
+        - array_of_dfs: ndarray, shape (1, n) containing pandas DataFrames.
+        - mediator_formula: str, formula for the mediator model.
+        - outcome_formula: str, formula for the outcome model.
+        - treat: str, the treatment variable in the mediation analysis.
+        - mediator: str, the mediator variable in the mediation analysis.
+        - test_iterations: int, number of iterations to run.
+
+    Returns:
+        - ndarray of shape (n,) containing the ACME values from the mediation analysis.
+    """
+
+    print('Starting sequential processing: ' + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    results = []
+    n_dfs = min(test_iterations, array_of_dfs.shape[1])
+
+
+    # for j in tqdm(range(n_dfs), desc="Processing DataFrames"):
+    for j in tqdm(range(155, 161), desc="Processing DataFrames"):  # for test
+        df = array_of_dfs[0, j]
+        try:
+            # Process the DataFrame and get the ACME value
+            acme = process_single_dataframe_hat_mediation_ACME(
+                df,
+                mediator_formula,
+                outcome_formula,
+                treat,
+                mediator
+            )
+            results.append(acme)
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            results.append(np.nan)
+
+    # Convert results to a NumPy array
+    acme_values = np.array(results, dtype=float)
+
+    # Handle NaN values
+    nan_indices = np.isnan(acme_values)
+    if np.any(nan_indices):
+        print(f"NaN values found at indices: {np.where(nan_indices)[0]}")
+        # Optionally, save the DataFrames that caused NaNs for inspection
+        for idx in np.where(nan_indices)[0]:
+            df_with_nan = array_of_dfs[0, idx]
+            df_with_nan.to_excel(f"DataFrame_with_NaN_at_index_{idx}.xlsx", index=False)
+            print(f"DataFrame with NaN exported to DataFrame_with_NaN_at_index_{idx}.xlsx")
+
+    # Save the ACME results
+    np.save('acme_values.npy', acme_values)
+    print('ACME values saved to acme_values.npy')
+
+    return acme_values
+
+'''
+lavaan package for mediation analysis
+ACME parallel version 
+'''
+
+def process_single_dataframe_hat_mediation_ACME(
+    df,
+    mediator_formula,
+    outcome_formula,
+    treat='category_cond2',
+    mediator='distance'
+):
+    """Helper function to process a single DataFrame using the mediation model."""
+    try:
+        # Compute ACME using fit_mediation_model_R_ACME
+        # acme = fit_mediation_model_R_ACME(
+        #     data=df,
+        #     mediator_formula=mediator_formula,
+        #     outcome_formula=outcome_formula,
+        #     treat=treat,
+        #     mediator=mediator
+        # )
+        #
+        acme = fit_mediation_model_R_lavaan_single_random_effect(
+            data = df,
+            treat='category_cond2',
+            mediator='distance',
+            outcome='logicalScoreDiff',
+            group='subId_cond1',
+            bootstrap_samples=1000
+        )
+        return acme
+    except Exception as e:
+        print(f"Error processing DataFrame: {e}")
+        return np.nan
+
 
 '''
 one channel all time points find and test cluster
@@ -2325,863 +4228,6 @@ def plot_heatmap(ts_stats, chllabels, time_unit=[0, 0.1], lim=[-7, 7], xlabel='T
     # Display the plot
     plt.tight_layout()
     plt.show()
-
-'''
-
-part for calculate distance 
-including vectorize data and  calculate distance series 
-
-'''
-
-
-def limtozero(value):
-    """ Ensure that negative values are set to zero. """
-    return max(value, 0)
-def condition_difference_score_permutations(data, time_opt='features',
-                                            time_win=50, time_step=5,
-                                            method='correlation', use_abs=False,
-                                            return_type='all'):
-    """
-    for sigle subject? 应该是了, 否则会有 mix model
-
-    Calculate distances representing the differences between two conditions in EEG data across time windows,
-    considering all possible pairings of trials between the two conditions using specified distance metric.
-
-    Parameters:
-    - data (numpy.ndarray): The input data with shape [n_conds=2, n_trials, n_chls, n_ts]
-        where n_conds must be 2, n_trials is the number of trials, n_chls is the number of channels,
-        and n_ts is the number of time samples.
-    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
-        'features' to use the reshaped feature vectors. Default is 'features'.
-    - time_win (int): Length of the time window over which to calculate the distance.
-    - time_step (int): Step size to move the window across the time samples.
-    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
-    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
-    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
-        'all' returns an array of all computed distances per window.
-
-    Returns:
-    - numpy.ndarray: Depending on return_type, either an array of mean distances per window or a nested
-      array of all distances for each window.
-    """
-    n_trials = data.shape[1]
-    n_chls = data.shape[2]
-    n_ts = data.shape[3]
-    n_windows = (n_ts - time_win) // time_step + 1
-    results = []
-
-    for window_idx in range(n_windows):
-        start_idx = window_idx * time_step
-        end_idx = start_idx + time_win
-        data_window = data[:, :, :, start_idx:end_idx]
-
-        if time_opt == 'average':
-            data_preprocessed = data_window.mean(axis=3)
-        elif time_opt == 'features':
-            data_preprocessed = data_window.reshape(2, n_trials, n_chls * time_win)
-
-        distances = []
-        for i in range(n_trials):
-            for j in range(i + 1,n_trials):
-                if method == 'correlation':
-                    # keep original r, becasue r have a range of [-1, 1],
-                    r, _ = pearsonr(data_preprocessed[0, i], data_preprocessed[1, j])
-                    # distance = 1 - np.abs(r) if use_abs else 1 - r
-                    distance = r
-                elif method == 'euclidean':
-                    distance = np.linalg.norm(data_preprocessed[0, i] - data_preprocessed[1, j])
-                distances.append(distance)
-
-        if return_type == 'mean':
-            mean_distance = np.mean(distances)
-            results.append(mean_distance)
-        elif return_type == 'all':
-            results.append(distances)
-
-    return np.array(results)
-
-# Example usage:
-# data = np.random.rand(2, 10, 5, 100)  # Simulated data: [2 conditions, 10 trials, 5 channels, 100 time samples]
-# mean_distances = condition_difference_score_permutations(data, return_type='mean')
-# all_distances = condition_difference_score_permutations(data, return_type='all')
-#
-#
-'''
-update 2024年10月6日:
-To handle unequal numbers of trials between conditions.
-
-Explanation of Changes
-Separate Data for Each Condition:
-Extracted data_cond1 and data_cond2 from data.
-Now we can handle different numbers of trials for each condition.
-Adjusted Data Preprocessing:
-Applied preprocessing separately for each condition:
-Modified Nested Loops:
-Looped over trials in both conditions:
-Distance Computation:
-Computed distances between all possible pairs of trials from condition 1 and condition 2.
-Distance Metric Adjustment:
-For the correlation method, adjusted the calculation of distance based on use_abs:
-Return Value:
-The function now returns distances correctly computed over all trial pairs between conditions.
-Returned as a NumPy array for consistency.
-
-'''
-def condition_difference_score_permutations(data, time_opt='features',
-                                            time_win=50, time_step=5,
-                                            method='correlation', use_abs=False,
-                                            return_type='all'):
-    """
-    Calculate distances representing the differences between two conditions in EEG data across time windows,
-    considering all possible pairings of trials between the two conditions using specified distance metric.
-
-    Parameters:
-    - data (list or numpy.ndarray): The input data containing data for two conditions.
-        Should be a list or array with elements:
-        data[0]: Data for condition 1, shape (n_trials_cond1, n_channels, n_timepoints)
-        data[1]: Data for condition 2, shape (n_trials_cond2, n_channels, n_timepoints)
-    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
-        'features' to use the reshaped feature vectors. Default is 'features'.
-    - time_win (int): Length of the time window over which to calculate the distance.
-    - time_step (int): Step size to move the window across the time samples.
-    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
-    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
-    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
-        'all' returns an array of all computed distances per window.
-
-    Returns:
-    - numpy.ndarray: Depending on return_type, either an array of mean distances per window or a list
-      of arrays of distances for each window.
-    """
-    data_cond1 = data[0]  # Shape: (n_trials_cond1, n_channels, n_timepoints)
-    data_cond2 = data[1]  # Shape: (n_trials_cond2, n_channels, n_timepoints)
-
-    n_trials_cond1 = data_cond1.shape[0]
-    n_trials_cond2 = data_cond2.shape[0]
-    n_chls = data_cond1.shape[1]
-    n_ts = data_cond1.shape[2]
-    n_windows = (n_ts - time_win) // time_step + 1
-    results = []
-
-    for window_idx in range(n_windows):
-        start_idx = window_idx * time_step
-        end_idx = start_idx + time_win
-        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
-        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
-
-        if time_opt == 'average':
-            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)  # Shape: (n_trials_cond1, n_chls)
-            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)  # Shape: (n_trials_cond2, n_chls)
-        elif time_opt == 'features':
-            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, n_chls * time_win)
-            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, n_chls * time_win)
-
-        distances = []
-        for i in range(n_trials_cond1):
-            for j in range(n_trials_cond2):
-                if method == 'correlation':
-                    r, _ = pearsonr(data_preprocessed_cond1[i], data_preprocessed_cond2[j])
-                    if use_abs:
-                        distance = 1 - abs(r)
-                    else:
-                        # distance = 1 - r  # Inverse correlation to get distance
-                        distance = r  # the sign of r have meaning, 1-r will lose this information.
-                elif method == 'euclidean':
-                    distance = np.linalg.norm(data_preprocessed_cond1[i] - data_preprocessed_cond2[j])
-                distances.append(distance)
-
-        if return_type == 'mean':
-            mean_distance = np.mean(distances)
-            results.append(mean_distance)
-        elif return_type == 'all':
-            results.append(distances)
-
-    return np.array(results)
-'''
-update 2024年10月6日:
-Here's how we can proceed:
-Modify condition_difference_score_permutations to store trial pair indices along with the distances.
-Adjust normalize_across_comparisons_trial to handle the new output format.
-Ensure that the rest of your code can process the new data structure.
----
-1. Modify condition_difference_score_permutations to Store Trial Pair Information
-We'll update the function to return not just the distances but also the indices of the trial pairs that were compared.
-We'll achieve this by storing tuples of (distance, trial_index_cond1, trial_index_cond2).
-
-'''
-def condition_difference_score_permutations(data, time_opt='features',
-                                            time_win=50, time_step=5,
-                                            method='correlation', use_abs=False,
-                                            return_type='all'):
-    """
-    Calculate distances representing the differences between two conditions in EEG data across time windows,
-    considering all possible pairings of trials between the two conditions using specified distance metric,
-    and keeping track of trial pairs.
-
-    Parameters:
-    - data (list or numpy.ndarray): The input data containing data for two conditions.
-        data[0]: Data for condition 1, shape (n_trials_cond1, n_channels, n_timepoints)
-        data[1]: Data for condition 2, shape (n_trials_cond2, n_channels, n_timepoints)
-    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
-        'features' to use the reshaped feature vectors. Default is 'features'.
-    - time_win (int): Length of the time window over which to calculate the distance.
-    - time_step (int): Step size to move the window across the time samples.
-    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
-    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
-    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
-        'all' returns a list of lists, each containing tuples with distances and trial indices.
-
-    Returns:
-    - If return_type is 'mean':
-        - numpy.ndarray: Array of mean distances per window.
-    - If return_type is 'all':
-        - List of lists for each window, where each inner list contains tuples:
-            (distance, trial_index_cond1, trial_index_cond2)
-    """
-    data_cond1 = data[0]  # Shape: (n_trials_cond1, n_channels, n_timepoints)
-    data_cond2 = data[1]  # Shape: (n_trials_cond2, n_channels, n_timepoints)
-
-    n_trials_cond1 = data_cond1.shape[0]
-    n_trials_cond2 = data_cond2.shape[0]
-    n_chls = data_cond1.shape[1]
-    n_ts = data_cond1.shape[2]
-    n_windows = (n_ts - time_win) // time_step + 1
-    results = []
-
-    for window_idx in range(n_windows):
-        start_idx = window_idx * time_step
-        end_idx = start_idx + time_win
-        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
-        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
-
-        if time_opt == 'average':
-            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)  # Shape: (n_trials_cond1, n_chls)
-            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)  # Shape: (n_trials_cond2, n_chls)
-        elif time_opt == 'features':
-            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, n_chls * time_win)
-            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, n_chls * time_win)
-
-        distances = []
-        for i in range(n_trials_cond1):
-            for j in range(n_trials_cond2):
-                if method == 'correlation':
-                    r, _ = pearsonr(data_preprocessed_cond1[i], data_preprocessed_cond2[j])
-                    if use_abs:
-                        distance = 1 - abs(r)
-                    else:
-                        distance = 1 - r
-                elif method == 'euclidean':
-                    distance = np.linalg.norm(data_preprocessed_cond1[i] - data_preprocessed_cond2[j])
-                # Store the distance along with the trial indices
-                distances.append((distance, i, j))
-
-        if distances:
-            if return_type == 'mean':
-                mean_distance = np.mean([d[0] for d in distances])  # Extract distances for averaging
-                results.append(mean_distance)
-            elif return_type == 'all':
-                results.append(distances)
-        else:
-            # Handle cases where no distances were calculated
-            results.append(np.nan)
-
-    return results
-
-'''
-return including both distances and corresponding metadata for each trial pair.
-'''
-
-def condition_difference_score_permutations(data, metadata=None, time_opt='features',
-                                            time_win=50, time_step=5,
-                                            method='correlation', use_abs=False,
-                                            return_type='all'):
-    """
-    Calculate distances representing the differences between two conditions in EEG data across time windows,
-    considering all possible pairings of trials between the two conditions using specified distance metric,
-    and keeping track of trial pairs and their metadata.
-
-    Parameters:
-    - data (list or numpy.ndarray): The input data containing data for two conditions.
-        data[0]: Data for condition 1, shape (n_trials_cond1, n_channels, n_timepoints)
-        data[1]: Data for condition 2, shape (n_trials_cond2, n_channels, n_timepoints)
-    - metadata (list, optional): Metadata for the two conditions, each a DataFrame.
-        metadata[0]: Metadata for condition 1, shape (n_trials_cond1, n_features)
-        metadata[1]: Metadata for condition 2, shape (n_trials_cond2, n_features)
-    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
-        'features' to use the reshaped feature vectors. Default is 'features'.
-    - time_win (int): Length of the time window over which to calculate the distance.
-    - time_step (int): Step size to move the window across the time samples.
-    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
-    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
-    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
-        'all' returns a list of lists, each containing tuples with distances and trial indices.
-
-    Returns:
-    - If return_type is 'mean':
-        - numpy.ndarray: Array of mean distances per window.
-    - If return_type is 'all':
-        - List of lists for each window, where each inner list contains tuples:
-            (distance, trial_index_cond1, trial_index_cond2, metadata_cond1, metadata_cond2)
-    """
-    data_cond1 = data[0]  # Shape: (n_trials_cond1, n_channels, n_timepoints)
-    data_cond2 = data[1]  # Shape: (n_trials_cond2, n_channels, n_timepoints)
-
-    n_trials_cond1 = data_cond1.shape[0]
-    n_trials_cond2 = data_cond2.shape[0]
-    n_chls = data_cond1.shape[1]
-    n_ts = data_cond1.shape[2]
-    n_windows = (n_ts - time_win) // time_step + 1
-    results = []
-
-    for window_idx in range(n_windows):
-        start_idx = window_idx * time_step
-        end_idx = start_idx + time_win
-        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
-        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
-
-        if time_opt == 'average':
-            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)
-            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)
-        elif time_opt == 'features':
-            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, n_chls * time_win)
-            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, n_chls * time_win)
-
-        distances = []
-        for i in range(n_trials_cond1):
-            for j in range(n_trials_cond2):
-                if method == 'correlation':
-                    r, _ = pearsonr(data_preprocessed_cond1[i], data_preprocessed_cond2[j])
-                    distance = 1 - abs(r) if use_abs else 1 - r
-                elif method == 'euclidean':
-                    distance = np.linalg.norm(data_preprocessed_cond1[i] - data_preprocessed_cond2[j])
-
-                # Retrieve metadata for the trial pairs
-                metadata_cond1 = metadata[0].iloc[i] if metadata else None
-                metadata_cond2 = metadata[1].iloc[j] if metadata else None
-
-                # Store the distance along with the trial indices and metadata
-                distances.append((distance, i, j, metadata_cond1, metadata_cond2))
-
-        if distances:
-            if return_type == 'mean':
-                mean_distance = np.mean([d[0] for d in distances])
-                results.append(mean_distance)
-            elif return_type == 'all':
-                results.append(distances)
-        else:
-            results.append(np.nan)
-
-    return results
-
-
-'''
-the core function to calculate the distance between two conditions 
-for 1 subject.
-loop over time windows - trial pair 
-'''
-
-
-def condition_difference_score_permutations(data, metadata=None, time_opt='features',
-                                            time_win=50, time_step=5,
-                                            method='correlation', use_abs=False,
-                                            return_type='all'):
-    """
-    Calculate distances representing the differences between two conditions in EEG data across time windows,
-    considering all possible pairings of trials between the two conditions using specified distance metric,
-    and keeping track of trial pairs and their metadata.
-
-    Parameters:
-    - data (list or numpy.ndarray): The input data containing data for two conditions.
-        data[0]: Data for condition 1, shape (n_trials_cond1, n_channels, n_timepoints)
-        data[1]: Data for condition 2, shape (n_trials_cond2, n_channels, n_timepoints)
-    - metadata (list, optional): Metadata for the two conditions, each a DataFrame.
-        metadata[0]: Metadata for condition 1, shape (n_trials_cond1, n_features)
-        metadata[1]: Metadata for condition 2, shape (n_trials_cond2, n_features)
-    - time_opt (str): Option to preprocess the data; 'average' to average all time points,
-        'features' to use the reshaped feature vectors. Default is 'features'.
-    - time_win (int): Length of the time window over which to calculate the distance.
-    - time_step (int): Step size to move the window across the time samples.
-    - method (str): Method to calculate distance between trials ('euclidean' or 'correlation').
-    - use_abs (bool): If using 'correlation', whether to use the absolute value of the correlation coefficient.
-    - return_type (str): Determines the return value; 'mean' returns the average distance per window,
-        'all' returns a list of DataFrames for each window.
-
-    Returns:
-    - If return_type is 'mean':
-        - numpy.ndarray: Array of mean distances per window.
-    - If return_type is 'all':
-        - List of DataFrames for each window, where each DataFrame contains:
-            - 'distance': Distance value
-            - Metadata columns from both conditions
-    """
-    data_cond1 = data[0]
-    data_cond2 = data[1]
-
-    n_trials_cond1 = data_cond1.shape[0]
-    n_trials_cond2 = data_cond2.shape[0]
-    n_chls = data_cond1.shape[1]
-    n_ts = data_cond1.shape[2]
-    n_windows = (n_ts - time_win) // time_step + 1
-    results = []
-
-    start_time = time.time()
-    for window_idx in range(n_windows):
-        start_idx = window_idx * time_step
-        end_idx = start_idx + time_win
-        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
-        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
-
-        if time_opt == 'average':
-            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)
-            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)
-        elif time_opt == 'features':
-            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, n_chls * time_win)
-            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, n_chls * time_win)
-
-        rows = []
-
-        for i in range(n_trials_cond1):
-            for j in range(n_trials_cond2):
-                if method == 'correlation':
-                    r, _ = pearsonr(data_preprocessed_cond1[i], data_preprocessed_cond2[j])
-                    # distance = 1 - abs(r) if use_abs else 1 - r
-                    distance = r # the original r have meaning in this case. the sign or r.
-                elif method == 'euclidean':
-                    distance = np.linalg.norm(data_preprocessed_cond1[i] - data_preprocessed_cond2[j])
-
-                # Retrieve metadata for the trial pairs
-                metadata_cond1 = metadata[0].iloc[i] if metadata else pd.Series()
-                metadata_cond2 = metadata[1].iloc[j] if metadata else pd.Series()
-
-                # Combine distance and metadata into a single row
-                row = pd.concat([pd.Series({'distance': distance}), metadata_cond1.add_suffix('_cond1'), metadata_cond2.add_suffix('_cond2')])
-                rows.append(row)
-        end_time = time.time()
-
-        if rows:
-            df = pd.DataFrame(rows)
-            results.append(df)
-        else:
-            results.append(pd.DataFrame())
-
-    print(f"trial pairs number: {n_trials_cond1*n_trials_cond2}")
-    print(f"loop over time windows : {end_time - start_time:.2f} seconds")
-
-    return results
-
-
-'''
-Key Changes and Benefits
-Vectorized Computations: Replaces the nested loops with vectorized operations, significantly reducing computation time.
-Efficient Use of cdist: Utilizes scipy.spatial.distance.cdist to compute the pairwise distances between all trials in one function call.
-Avoids Unnecessary Loops and Function Calls: Eliminates the per-trial overhead of calling pearsonr and using Pandas operations inside loops.
-2. Optimize Data Structures and Memory Usage
-Avoid Growing Lists in Loops: Preallocate lists or arrays when possible. This prevents the overhead of dynamically resizing data structures.
-Efficient Metadata Handling: Instead of fetching and concatenating metadata inside loops, use indexing and vectorized operations to prepare the metadata for all combinations.
-'''
-from scipy.spatial.distance import cdist
-
-def condition_difference_score_permutations(data, metadata=None, time_opt='features',
-                                            time_win=50, time_step=5,
-                                            method='correlation', use_abs=False,
-                                            return_type='all'):
-    """
-    Optimized version using vectorized computations.
-    """
-    data_cond1 = data[0]  # Shape: (n_trials_cond1, n_channels, n_timepoints)
-    data_cond2 = data[1]  # Shape: (n_trials_cond2, n_channels, n_timepoints)
-
-    n_trials_cond1, n_chls, n_ts = data_cond1.shape
-    n_trials_cond2 = data_cond2.shape[0]
-    n_windows = (n_ts - time_win) // time_step + 1
-    results = []
-
-    for window_idx in range(n_windows):
-        start_idx = window_idx * time_step
-        end_idx = start_idx + time_win
-        data_window_cond1 = data_cond1[:, :, start_idx:end_idx]
-        data_window_cond2 = data_cond2[:, :, start_idx:end_idx]
-
-        if time_opt == 'average':
-            data_preprocessed_cond1 = data_window_cond1.mean(axis=2)
-            data_preprocessed_cond2 = data_window_cond2.mean(axis=2)
-        elif time_opt == 'features':
-            data_preprocessed_cond1 = data_window_cond1.reshape(n_trials_cond1, -1)
-            data_preprocessed_cond2 = data_window_cond2.reshape(n_trials_cond2, -1)
-
-        if method == 'correlation':
-            # Standardize data
-            # data_preprocessed_cond1_z = (
-            #     data_preprocessed_cond1 - data_preprocessed_cond1.mean(axis=1, keepdims=True)
-            # ) / data_preprocessed_cond1.std(axis=1, ddof=1, keepdims=True)
-            # data_preprocessed_cond2_z = (
-            #     data_preprocessed_cond2 - data_preprocessed_cond2.mean(axis=1, keepdims=True)
-            # ) / data_preprocessed_cond2.std(axis=1, ddof=1, keepdims=True)
-            # Compute correlation distances
-            # distance_matrix = cdist(data_preprocessed_cond1_z, data_preprocessed_cond2_z, metric='correlation')
-            distance_matrix = cdist(data_preprocessed_cond1, data_preprocessed_cond2, metric='correlation')
-
-            if not use_abs:
-                # Convert correlation distance back to correlation coefficient
-                distance_matrix = 1 - distance_matrix
-            else:
-                # Use absolute correlation coefficient
-                # distance_matrix = 1 - np.abs(1 - distance_matrix)
-                distance_matrix = distance_matrix
-
-        elif method == 'euclidean':
-            distance_matrix = cdist(data_preprocessed_cond1, data_preprocessed_cond2, metric='euclidean')
-
-        # Flatten the distance matrix for DataFrame construction
-        distances_flat = distance_matrix.flatten()
-
-        # Create indices for trials
-        idx_cond1 = np.repeat(np.arange(n_trials_cond1), n_trials_cond2)
-        idx_cond2 = np.tile(np.arange(n_trials_cond2), n_trials_cond1)
-
-        # Prepare metadata for all combinations
-        if metadata:
-            metadata_cond1 = metadata[0].iloc[idx_cond1].reset_index(drop=True)
-            metadata_cond2 = metadata[1].iloc[idx_cond2].reset_index(drop=True)
-        else:
-            metadata_cond1 = pd.DataFrame()
-            metadata_cond2 = pd.DataFrame()
-
-        # Create DataFrame
-        df = pd.DataFrame({'distance': distances_flat})
-        if not metadata_cond1.empty:
-            df = pd.concat([df, metadata_cond1.add_suffix('_cond1').reset_index(drop=True)], axis=1)
-        if not metadata_cond2.empty:
-            df = pd.concat([df, metadata_cond2.add_suffix('_cond2').reset_index(drop=True)], axis=1)
-
-        results.append(df)
-
-    return results
-
-def normalize_across_comparisons(data, normalize=True):
-    """
-    Compute distances for two comparisons (Cond1 vs Cond2 and Cond1 vs Cond3),
-    and optionally normalize these distances based on the global min and max from both sets.
-
-    Parameters:
-    - data: array, input data containing conditions.
-    - normalize: bool, if True, normalize the distances; if False, return raw distances.
-
-    Returns:
-    - Tuple of arrays, normalized or raw distances for the two comparisons.
-    """
-    # Extract data subsets for the two comparisons
-    cond1_vs_cond2 = np.array([data[0], data[1]])
-    cond1_vs_cond3 = np.array([data[0], data[2]])
-
-    # Calculate distances for both comparisons
-    distances1 = condition_difference_score_permutations(cond1_vs_cond2)
-    distances2 = condition_difference_score_permutations(cond1_vs_cond3)
-
-    if normalize:
-        # Combine distances to find the global min and max
-        combined_distances = np.concatenate((distances1, distances2))
-        min_distance = np.min(combined_distances)
-        max_distance = np.max(combined_distances)
-
-        # Normalize distances based on global min and max
-        if max_distance != min_distance:
-            normalized_distances1 = (distances1 - min_distance) / (max_distance - min_distance)
-            normalized_distances2 = (distances2 - min_distance) / (max_distance - min_distance)
-        else:
-            normalized_distances1 = np.zeros_like(distances1)
-            normalized_distances2 = np.zeros_like(distances2)
-
-        return normalized_distances1, normalized_distances2
-    else:
-        # Return raw distances if normalization is not requested
-        return distances1, distances2
-# Example use
-# Assuming data is your EEG dataset with the shape (3, n_trials, n_chls, n_ts)
-# data = np.random.rand(3, 100, 32, 500)  # Simulated EEG data
-# normalized_distances1, normalized_distances2 = normalize_across_comparisons(data)
-# print("Normalized scores for Condition 1 vs Condition 2:", normalized_distances1)
-# print("Normalized scores for Condition 1 vs Condition 3:", normalized_distances2)
-
-
-'''
-
-don't aveage the decoding accuracy for each trial, remain original data.
-
-'''
-
-def normalize_across_comparisons_trial(subdata, normalize=False):
-    """
-    Normalize and compute distances between conditions, returning DataFrames with distance and metadata.
-
-    Parameters:
-    - subdata (dict): Dictionary containing:
-        - 'data': List of data arrays for each condition.
-        - 'metadata': List of metadata DataFrames for each condition.
-    - normalize (bool): Whether to normalize distances.
-
-    Returns:
-    - df1, df2: DataFrames containing distances and metadata for the two comparisons.
-    """
-    data = subdata['data']
-    metadata = subdata['metadata']
-
-    # Extract data subsets for the two comparisons
-    cond1_vs_cond2 = [data[0], data[1]]
-    cond1_vs_cond3 = [data[0], data[2]]
-
-    # Calculate distances for both comparisons
-    df1 = condition_difference_score_permutations(cond1_vs_cond2, metadata=[metadata[0], metadata[1]], return_type='all')
-    df2 = condition_difference_score_permutations(cond1_vs_cond3, metadata=[metadata[0], metadata[2]], return_type='all')
-
-    if normalize:
-        # Normalize distances in each DataFrame
-        df1['distance'] = df1['distance'] / df1['distance'].max()
-        df2['distance'] = df2['distance'] / df2['distance'].max()
-
-    return df1, df2
-
-
-# Function to process data for a given set of channels
-'''
-
-process_channels
-then 
-process_field
-
-
-
-loop subjects
-'''
-import gc
-def process_channels(
-        list_epochs_One,list_epochs_M2,list_epochs_S2,
-        field_channels,T1_sub_ids):
-
-    '''
-    # ## 数据整理 for distance
-    # 每个被试一个df,hope to 包括了 行为数据列 和 各个通道 某个时间点的信号数据列
-    # 
-    # if I want to calculate based on different fields, I should only change the parameters of channels_all.
-    '''
-    # Start timing for the entire block
-    overall_start_time = time.time()
-
-    # data for specific field(4-5 channels)
-    list_subdata = organize_eeg_data_by_subject_and_condition(T1_sub_ids, list_epochs_One, list_epochs_M2,
-                                                              list_epochs_S2, field_channels)
-
-    n_subs = len(list_subdata)
-    # example_data = normalize_across_comparisons_trial(list_subdata[0], normalize=False)
-    # n_windows = len(example_data[0])  # Assuming each entry in the example_data is a list for each window
-
-    # Initialize lists to store lists of distances for all subjects
-    normalized_distances_all_1 = [[] for _ in range(n_subs)]
-    normalized_distances_all_2 = [[] for _ in range(n_subs)]
-
-    # Loop over each subject's data to calculate distances
-    for idx, data in enumerate(list_subdata):
-        normalized_distances1, normalized_distances2 = normalize_across_comparisons_trial(data, normalize=False)
-        normalized_distances_all_1[idx] = normalized_distances1
-        normalized_distances_all_2[idx] = normalized_distances2
-
-    # Example of accessing the first window's data for the first subject
-    # print("Distances for the first window of the first subject (Cond1 vs Cond2):", normalized_distances_all_1[0][0])
-    # print("Distances for the first window of the first subject (Cond1 vs Cond3):", normalized_distances_all_2[0][0])
-
-    # Assuming 'normalized_distances_all_1' is loaded as described, with shape [n_subs, n_wins][n_distances]
-
-    # sub_ids = T1_sub_ids
-
-    # Initialize lists to hold the dataframes for each window for both comparison sets
-    windows_dataframes_1 = []
-    windows_dataframes_2 = []
-
-    n_wins = 91  # Replace with dynamically determined value if necessary
-    sub_ids = T1_sub_ids
-
-    # to reform data structure, the distance calculation is finished before this step.
-    # no meaning but to match the requirement of former version code.
-    for window_index in range(n_wins):  # Replace 91 with n_wins if dynamically determined elsewhere
-        # Initialize lists to collect all subjects' data for the current window for both sets
-        all_subjects_data_1 = []
-        all_subjects_data_2 = []
-
-        # Gather data for each subject in this window for both sets
-        for sub_index, sub_id in enumerate(sub_ids):
-            # Get the distances for the current subject in the current window from both sets
-            distances_1 = normalized_distances_all_1[sub_index][window_index]
-            distances_2 = normalized_distances_all_2[sub_index][window_index]
-
-            sub_df_1 = distances_1
-            sub_df_2 = distances_2
-
-            # Append the DataFrames to their respective lists
-            all_subjects_data_1.append(sub_df_1)
-            all_subjects_data_2.append(sub_df_2)
-
-        # Concatenate all subjects' data into a single DataFrame for the current window for both sets
-        window_df_1 = pd.concat(all_subjects_data_1, ignore_index=True)
-        window_df_2 = pd.concat(all_subjects_data_2, ignore_index=True)
-
-        # Append the concatenated DataFrames to the lists holding windows DataFrames
-        windows_dataframes_1.append(window_df_1)
-        windows_dataframes_2.append(window_df_2)
-        '''
-    ## integrate with additional data for mix model calculation.
-
-    data strctrure: 
-
-    a list of dataframes, each dataframe contains the data for one window, and each row represents one subject's data for that window.
-
-    '''
-
-    # additional_data = pd.read_csv('I:\pycharmProject\pre10\统计和建模\\filtered_pivoted_data_2024年03月14日.csv')
-    #
-    # Merge and combine windows_dataframes_1 and windows_dataframes_2 with additional_data
-    # windows_dataframes_merged_1 = []
-    # windows_dataframes_merged_2 = []
-    #
-    # for window_df_1, window_df_2 in zip(windows_dataframes_1, windows_dataframes_2):
-    #     merged_df_1 = pd.merge(window_df_1, additional_data, on=['subId', 'category'], how='left')
-    #     windows_dataframes_merged_1.append(merged_df_1)
-    #
-    #     merged_df_2 = pd.merge(window_df_2, additional_data, on=['subId', 'category'], how='left')
-    #     windows_dataframes_merged_2.append(merged_df_2)
-    #
-    # Combine the corresponding DataFrames from merged lists vertically
-    # final_merged_dataframes = []
-    # for merged_df_1, merged_df_2 in zip(windows_dataframes_merged_1, windows_dataframes_merged_2):
-    #     final_df = pd.concat([merged_df_1, merged_df_2], ignore_index=True)
-    #     final_merged_dataframes.append(final_df)
-
-
-    windows_dataframes_merged_1 = []
-    windows_dataframes_merged_2 = []
-
-    for window_df_1, window_df_2 in zip(windows_dataframes_1, windows_dataframes_2):
-        # merged_df_1 = pd.merge(window_df_1, additional_data, on=['subId', 'category'], how='left')
-        windows_dataframes_merged_1.append(window_df_1)
-
-        # merged_df_2 = pd.merge(window_df_2, additional_data, on=['subId', 'category'], how='left')
-        windows_dataframes_merged_2.append(window_df_2)
-
-    # Combine the corresponding DataFrames from merged lists vertically
-    final_merged_dataframes = []
-    for merged_df_1, merged_df_2 in zip(windows_dataframes_merged_1, windows_dataframes_merged_2):
-        final_df = pd.concat([merged_df_1, merged_df_2], ignore_index=True)
-        final_merged_dataframes.append(final_df)
-
-    '''
-    ## calculate the mean just for plotting.
-
-    plot_tbyt_diff_decoding_acc need these two arrays:
-    '''
-
-    all_distances_M = []
-    all_distances_S = []
-    # Initialize a new list to store the averaged DataFrames
-    averaged_dataframes = []
-
-    # for df in final_merged_dataframes:
-    #     # Group by 'category' and 'subId' and calculate the mean
-    #     averaged_df = df.groupby(['category_cond2', 'subId_cond2']).mean().reset_index()
-    #     averaged_dataframes.append(averaged_df)
-    for df in final_merged_dataframes:
-        # Select only numeric columns for aggregation
-        numeric_df = df.select_dtypes(include=[np.number])
-        # Group by 'category_cond2' and 'subId_cond2' and calculate the mean
-        averaged_df = numeric_df.groupby([df['category_cond2'], df['subId_cond2']]).mean().reset_index()
-        # Add back non-numeric columns if needed
-        non_numeric_df = df.select_dtypes(exclude=[np.number]).drop_duplicates(subset=['category_cond2', 'subId_cond2'])
-        averaged_df = pd.merge(averaged_df, non_numeric_df, on=['category_cond2', 'subId_cond2'], how='left')
-        averaged_dataframes.append(averaged_df)
-
-
-    # Initialize empty lists to store distance values for both categories
-    all_distances_M = []
-    all_distances_S = []
-
-    # Loop through each DataFrame in the list
-    for df in averaged_dataframes:
-        # Filter the DataFrame for category 'M' and extract distance values
-        filtered_distances_M = df[df['category_cond2'] == 'M']['distance'].values
-        # Filter the DataFrame for category 'S' and extract distance values
-        filtered_distances_S = df[df['category_cond2'] == 'S']['distance'].values
-
-        # Append the distances to the corresponding list
-        all_distances_M.append(filtered_distances_M)
-        all_distances_S.append(filtered_distances_S)
-
-    # Horizontally stack all distance arrays from category 'M' to create a single ndarray
-    # This requires each array to have the same length
-    final_distances_array_M = np.column_stack(all_distances_M)
-
-    # Horizontally stack all distance arrays from category 'S' to create a single ndarray
-    # This requires each array to have the same length
-    final_distances_array_S = np.column_stack(all_distances_S)
-
-    # Print the resulting ndarrays
-    # print("Distances for category M:", final_distances_array_M)
-    # print("Distances for category S:", final_distances_array_S)
-
-    # End timing for the entire block
-    overall_end_time = time.time()
-    print(f"****loop all subjects: {overall_end_time - overall_start_time:.2f} seconds")
-
-    # save memory, delete the intermediate variables.
-    del list_subdata, normalized_distances_all_1, normalized_distances_all_2
-    gc.collect()
-
-    return final_distances_array_M, final_distances_array_S, final_merged_dataframes
-
-
-# Define the function to process each field
-# for one field.. convenient to parallel..
-'''
-    list_epochs_One = list()
-    list_epochs_M2 = list()
-    list_epochs_S2 = list()
-    
-why we have to load data in process_field() ?
-parallel problems
-every subprcess have its own memory space, so we have to load data in each process.
-'''
-def process_field(
-                  field_name,
-                  field_channels,
-                T1_sub_ids, T2M_sub_ids, T2S_sub_ids, num_epochs = 3):
-
-    ''''''
-    base_data_path = 'D:\\LYW\\pre10\\data\\6epoch_clean_allWords_fullMeta_sep\\'
-    # base_data_path = 'D:\\LYW\\pre10\\data\\6epoch_clean_equal\\' # test equal version organize_eeg_data_by_subject_and_condition function.
-
-    list_epochs_One = list()
-    list_epochs_M2 = list()
-    list_epochs_S2 = list()
-
-
-    # 调用函数读取T1_sub_ids对应的数据
-    load_epochs(T1_sub_ids, list_epochs_One, base_data_path, field_channels,
-                num_epochs=num_epochs)
-    # 调用函数读取T2M_sub_ids对应的数据，注意添加'M'作为文件名后缀
-    load_epochs(T2M_sub_ids, list_epochs_M2, base_data_path, field_channels,
-                num_epochs=num_epochs)
-    # 调用函数读取T2S_sub_ids对应的数据，注意添加'S'作为文件名后缀
-    load_epochs(T2S_sub_ids, list_epochs_S2, base_data_path, field_channels,
-                num_epochs=num_epochs)
-
-    print(f"Processing {field_name} with channels {field_channels}")
-    result_M, result_S, merged_dataframes = process_channels(
-        list_epochs_One,list_epochs_M2,list_epochs_S2,
-        field_channels, T1_sub_ids,
-        # T2M_sub_ids, T2S_sub_ids
-    )
-
-    del list_epochs_One, list_epochs_M2, list_epochs_S2
-    gc.collect()
-
-    return field_name, result_M, result_S, merged_dataframes
 
 #%%
 '''
