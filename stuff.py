@@ -2794,6 +2794,18 @@ csv_file_path = "D:\LYW\pre10\data\8 temporal-spatial\sub28\summary_coef_std_202
 # 这个对应的公式修改了 logicalScore1Diff + RT1Diff
 # formula <- 'distance ~ category_cond2 + logicalScore1Diff + RT1Diff + (1|subId_cond1) '
 csv_file_path = "D:\LYW\pre10\data\8 temporal-spatial\sub28/summary_coef_std_20250704_133507.csv"
+'''
+csv_file_path = "G:\8 temporal-spatial\sub28\summary_results_2024年11月14日.csv"
+其实本质上是一样的，都是每个时空点的这两个数据
+coef_estimate	std_error
+那么只需要更换stuff.py里的csv_file_path为
+D:\LYW\R for permutation t\Mplus\results\all_spatiotemporal_results_WLSMV_precise_parallel_ab.csv #这个是所有ab的精确值附在后面coef_estimate	std_error
+D:\LYW\R for permutation t\Mplus\results\all_spatiotemporal_results_WLSMV_precise_parallel_a.csv
+D:\LYW\R for permutation t\Mplus\results\all_spatiotemporal_results_WLSMV_precise_parallel_b.csv
+'''
+csv_file_path = "D:\LYW\R for permutation t\\Mplus\\results\\all_spatiotemporal_results_WLSMV_precise_parallel_ab.csv "
+
+
 
 # csv_file_path = "D:\LYW\pre10\data\permutation_summary_between\summary_results_permutation_1000.csv"
 
