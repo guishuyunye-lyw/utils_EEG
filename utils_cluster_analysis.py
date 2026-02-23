@@ -18,6 +18,135 @@ from typing import List, Tuple, Dict, Optional, Union
 import warnings
 
 
+def merge_significant_clusters(clusters_list: List) -> List:
+    """
+    合并多个显著cluster为单个cluster（处理扁平索引格式）
+
+    Parameters:
+    -----------
+    clusters_list : list
+        聚类列表，每个元素是扁平索引数组（1D integer array）
+
+    Returns:
+    --------
+    list : 合并后的聚类列表，包含一个合并后的扁平索引数组
+
+    Note:
+    -----
+    此函数处理扁平索引格式，与 notebook 中的原始实现一致。
+    转换为 (x_array, y_array) 格式应在后续步骤中进行。
+    """
+    if not clusters_list:
+        return []
+
+    # 合并所有cluster的索引
+    all_indices = []
+    for cluster in clusters_list:
+        all_indices.extend(cluster)
+
+    # 去重并排序
+    merged_indices = np.unique(all_indices)
+
+    # 返回包含单个合并cluster的列表
+    return [merged_indices]
+
+
+def merge_significant_clusters_tuples(clusters_list: List) -> List:
+    """
+    合并多个显著cluster为单个cluster，保持 (x_array, y_array) 格式
+
+    Parameters:
+    -----------
+    clusters_list : list of tuples
+        聚类列表，每个元素是 (x_array, y_array) 元组
+        x_array = 时间索引数组
+        y_array = 空间/通道索引数组
+
+    Returns:
+    --------
+    list : 合并后的聚类列表，包含一个 (merged_x, merged_y) 元组
+
+    Note:
+    -----
+    此函数用于已经转换为元组格式的聚类数据。
+    如果数据是扁平索引格式，请使用 merge_significant_clusters()。
+    """
+    if not clusters_list:
+        return []
+
+    all_x = []
+    all_y = []
+    for x_array, y_array in clusters_list:
+        all_x.extend(x_array)
+        all_y.extend(y_array)
+
+    # 合并（保持配对关系）
+    merged_x = np.array(all_x)
+    merged_y = np.array(all_y)
+
+    return [(merged_x, merged_y)]
+
+
+def filter_clusters_in_intervals(good_clusters: List, step: int = 10,
+                                  remove_empty: bool = True) -> Dict[str, List]:
+    """
+    Filters each (x_array, y_array) tuple in `good_clusters` by automatically generated
+    intervals (0–step, step–2*step, etc.) up to the maximum value found in any x_array.
+
+    Parameters:
+    -----------
+    good_clusters : list of tuples
+        Each element is a tuple (x_array, y_array), where x_array and y_array are NumPy arrays.
+    step : int
+        The size of each interval. Defaults to 10.
+    remove_empty : bool
+        If True, filters out intervals whose lists end up empty.
+
+    Returns:
+    --------
+    dict
+        A dictionary keyed by string interval (e.g., '0-10') where each value is a list
+        of filtered (x_array, y_array) tuples. If remove_empty=True, intervals
+        containing no data are omitted.
+    """
+    if not good_clusters:
+        return {}
+
+    # 1) Find the global max among x_arrays
+    global_max = max(x_array.max() for x_array, _ in good_clusters)
+
+    # 2) Build intervals
+    intervals = []
+    start = 0
+    while start < global_max:
+        end = start + step
+        intervals.append((start, end))
+        start = end
+
+    # 3) Dictionary to hold the filtered results
+    filtered_dict = {}
+
+    # 4) Filter for each interval
+    for (start, end) in intervals:
+        interval_label = f"{start}-{end}"
+        filtered_list = []
+
+        for x_array, y_array in good_clusters:
+            mask = (x_array >= start) & (x_array < end)
+            filtered_x = x_array[mask]
+            filtered_y = y_array[mask]
+
+            # Only keep if non-empty
+            if filtered_x.size > 0 and filtered_y.size > 0:
+                filtered_list.append((filtered_x, filtered_y))
+
+        # If remove_empty is False, store them even if empty
+        if not remove_empty or (remove_empty and len(filtered_list) > 0):
+            filtered_dict[interval_label] = filtered_list
+
+    return filtered_dict
+
+
 def filter_clusters_by_time_window(clusters, time_start: int, time_end: int) -> List[Tuple]:
     """
     根据时间窗口筛选聚类数据

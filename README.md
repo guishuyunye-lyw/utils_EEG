@@ -22,7 +22,7 @@ EEG 数据分析工具库，服务于间隔学习 vs 集中学习的记忆巩固
 |----------|------|
 | `prepare_permutation_csvs.ipynb` | Step 1: 从 Mplus 原始 CSV 生成 6 组分析所需的 3 个 CSV 文件 |
 | `find_clusters_6groups.ipynb` | Step 2: 对 real data 和 permutation data 分 6 组找 cluster |
-| `utils_sumtPermu.ipynb` | 旧版 sum-t 置换检验流程（4 组，手动切换） |
+| `_archive/utils_sumtPermu.ipynb` | 旧版 sum-t 置换检验流程（4 组，手动切换），已归档 |
 | `utils_tfcePermu.ipynb` | TFCE 置换检验流程 |
 | `拿到a b ab的z p.ipynb` | 从 Mplus 结果提取 a/b/ab 路径的 z 值和 p 值 |
 
@@ -35,9 +35,21 @@ EEG 数据分析工具库，服务于间隔学习 vs 集中学习的记忆巩固
 | `save_a_data.py` | 导出中介模型 a 路径结果到 CSV（独立脚本） |
 | `save_filtered_data.py` | 导出筛选/重命名后的结果到 CSV（独立脚本） |
 
+## Q&A
+
+### utils_sumtPermu.ipynb 和 find_clusters_6groups.ipynb 有什么区别？
+
+| 维度 | `utils_sumtPermu.ipynb` | `find_clusters_6groups.ipynb` |
+|------|------------------------|-------------------------------|
+| 定位 | 旧版单次运行工具 | 新版批量处理流程 |
+| 分组 | 4 组，手动切换 `csv_files` 列表 | 6 组，`GROUP_CONFIGS` 配置驱动自动循环 |
+| 中介拆分 | 手动调用 `split_csv_by_a_estimate()` | 假设 CSV 已预拆分（由 prepare_permutation_csvs.ipynb 完成） |
+| 可视化 | 置换分布直方图 | 6 组 cluster sum 对比柱状图 |
+| 状态 | 已归档至 `_archive/` | **当前使用的正式流程** |
+
 ## 6 组置换检验流程
 
-```
+```text
 Mplus 原始 CSV
     │
     ▼
